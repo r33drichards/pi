@@ -13,11 +13,17 @@ import {
 import {
 	AgentHarness,
 	type AgentHarness as AgentHarnessInstance,
+	type AgentHarnessTool,
 	type AgentLane,
 	BACKGROUND_CONTEXT,
 	createBashTool,
 	createReadTool,
+	createRunJsTool,
 	createWriteTool,
+	type ExecutionEnv,
+	type FileSystem,
+	type JavaScriptRuntime,
+	type JavaScriptToolContext,
 	type JsonlSessionMetadata,
 	JsonlSessionRepo,
 	type Session,
@@ -482,7 +488,7 @@ async function closeResources(resources: {
 	services?: SessionWorkerServices;
 	session?: Session<JsonlSessionMetadata>;
 	repo: JsonlSessionRepo;
-	executionEnv: NodeExecutionEnv;
+	executionEnv: SessionWorkerExecutionEnv;
 	releaseOwnership: () => Promise<void>;
 }): Promise<void> {
 	const errors: unknown[] = [];
@@ -516,13 +522,53 @@ async function closeResources(resources: {
 	if (errors.length > 1) throw new AggregateError(errors, "Session worker cleanup failed");
 }
 
+/**
+ * The environment a session worker runs in: the session store's filesystem plus
+ * either a shell (the default {@link NodeExecutionEnv}) or a JavaScript runtime
+ * such as the native mcp-js environment.
+ */
+export type SessionWorkerExecutionEnv = FileSystem & (ExecutionEnv | JavaScriptRuntime);
+
 export type CreateSessionWorkerHarness = (
 	session: Session<JsonlSessionMetadata>,
 	options: SessionWorkerOptions,
-	executionEnv: NodeExecutionEnv,
+	executionEnv: SessionWorkerExecutionEnv,
 ) => Promise<SessionWorkerRuntime>;
 
-async function run(options: SessionWorkerOptions, createHarness: CreateSessionWorkerHarness): Promise<void> {
+/** Build the execution environment for a session's working directory. */
+export type CreateSessionWorkerExecutionEnv = (cwd: string) => Promise<SessionWorkerExecutionEnv>;
+
+const createNodeExecutionEnv: CreateSessionWorkerExecutionEnv = async (cwd) => new NodeExecutionEnv({ cwd });
+
+function hasShell(env: SessionWorkerExecutionEnv): env is FileSystem & ExecutionEnv {
+	return "exec" in env && typeof env.exec === "function";
+}
+
+/**
+ * The built-in tools for an execution environment: read, write, and bash when the
+ * environment has a shell; read, write, and run_js when it only runs JavaScript.
+ * Tool schemas do not change, so the model sees the same read/write contract.
+ */
+export function createSessionWorkerTools(
+	env: SessionWorkerExecutionEnv,
+): AgentHarnessTool<{ env: SessionWorkerExecutionEnv }>[] {
+	if (hasShell(env)) {
+		return [createReadTool(), createWriteTool(), createBashTool()] as AgentHarnessTool<{
+			env: SessionWorkerExecutionEnv;
+		}>[];
+	}
+	return [
+		createReadTool<JavaScriptToolContext>(),
+		createWriteTool<JavaScriptToolContext>(),
+		createRunJsTool(),
+	] as AgentHarnessTool<{ env: SessionWorkerExecutionEnv }>[];
+}
+
+async function run(
+	options: SessionWorkerOptions,
+	createHarness: CreateSessionWorkerHarness,
+	createExecutionEnv: CreateSessionWorkerExecutionEnv,
+): Promise<void> {
 	const { sessionDir, metadata } = options;
 	const sessionId = metadata.id;
 	const control = await connectControl();
@@ -536,7 +582,7 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		update: 1_000,
 		retries: { retries: 320, factor: 1, minTimeout: 25, maxTimeout: 25, maxRetryTime: 8_000 },
 	});
-	const executionEnv = new NodeExecutionEnv({ cwd: metadata.cwd });
+	const executionEnv = await createExecutionEnv(metadata.cwd);
 	const repo = new JsonlSessionRepo({ fileSystem: executionEnv, sessionsRoot: sessionDir });
 	let session: Session<JsonlSessionMetadata> | undefined;
 	let harness: AgentHarnessInstance | undefined;
@@ -768,9 +814,18 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 	}
 }
 
+/**
+ * Run a session worker from its serialized options. `createExecutionEnv` selects
+ * the environment; the default is the Node shell environment. An embedding entry
+ * module can pass a JavaScript-only environment such as `McpJsExecutionEnv`
+ * (built from generated native bindings it imports itself) together with
+ * {@link createCodingAgentHarness}, and launch the worker through the
+ * internal-process `entryUrl` option.
+ */
 export async function runSessionWorkerWithHarness(
 	args: readonly string[],
 	createHarness: CreateSessionWorkerHarness,
+	createExecutionEnv: CreateSessionWorkerExecutionEnv = createNodeExecutionEnv,
 ): Promise<void> {
 	try {
 		if (args.length !== 1) throw new Error("Session worker requires one options argument");
@@ -789,7 +844,7 @@ export async function runSessionWorkerWithHarness(
 		) {
 			throw new Error("Session worker received invalid options");
 		}
-		await run(options, createHarness);
+		await run(options, createHarness, createExecutionEnv);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		const token = process.env[SESSION_WORKER_CONTROL_TOKEN_ENV];
@@ -802,10 +857,11 @@ export async function runSessionWorkerWithHarness(
 	}
 }
 
-async function createCodingAgentHarness(
+/** The coding agent's harness over any {@link SessionWorkerExecutionEnv}. */
+export async function createCodingAgentHarness(
 	session: Session<JsonlSessionMetadata>,
 	options: SessionWorkerOptions,
-	executionEnv: NodeExecutionEnv,
+	executionEnv: SessionWorkerExecutionEnv,
 ): Promise<SessionWorkerRuntime> {
 	const modelRuntime = await ModelRuntime.create();
 	const settingsManager = SettingsManager.create(session.metadata.cwd);
@@ -828,7 +884,7 @@ async function createCodingAgentHarness(
 		if (resolved.error) throw new Error(`Session worker could not resolve model: ${resolved.error}`);
 	}
 	if (!resolved.model) throw new Error("Session worker could not resolve a model");
-	const tools = [createReadTool(), createWriteTool(), createBashTool()];
+	const tools = createSessionWorkerTools(executionEnv);
 	const activeToolNames = tools.map((tool) => tool.name);
 	const harness = (
 		await AgentHarness.create(
