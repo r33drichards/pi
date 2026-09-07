@@ -1,29 +1,106 @@
 import { posix } from "node:path";
 import type { Context } from "../context.ts";
-import { err, FileError, type FileInfo, type FileSystem, ok, type Result, toError } from "../types.ts";
+import { err, FileError, type FileErrorCode, type FileInfo, type FileSystem, ok, type Result } from "../types.ts";
 import type { JavaScriptResult, JavaScriptRuntime } from "./javascript.ts";
 
-/** Structural boundary for the generated native UniFFI Engine; no HTTP or subprocess transport. */
+/** Metadata record returned by the native stat calls (UniFFI `FsMetadata`). */
+export interface McpJsNativeMetadata {
+	/** Unix mode bits, type bits included; synthesized on other platforms. */
+	mode: number;
+	size: bigint | number;
+	readonly: boolean;
+	modifiedMs?: number;
+}
+
+/**
+ * Structural boundary for the generated native UniFFI Engine created with
+ * `createWithFilesystem`: `run_js` through the tool API, files through the typed
+ * `fs*` methods. No HTTP or subprocess transport, no generated JavaScript for
+ * file access. Bytes cross as ArrayBuffers; failures reject with the same message
+ * the guest `fs.*` wrapper reports, including its Node-style code token.
+ */
 export interface McpJsNativeEngine {
 	callToolAsync(name: string, argumentsJson: string, sessionId: undefined, headers: undefined): Promise<string>;
+	hostFilesystemEnabled(): boolean;
+	fsReadFile(path: string): Promise<ArrayBuffer>;
+	fsReadFileRange(path: string, offset: bigint, maxBytes: bigint): Promise<ArrayBuffer>;
+	fsReadTextFile(path: string): Promise<string>;
+	fsWriteFile(path: string, data: ArrayBuffer): Promise<void>;
+	fsAppendFile(path: string, data: ArrayBuffer): Promise<void>;
+	fsStat(path: string): Promise<McpJsNativeMetadata>;
+	fsLstat(path: string): Promise<McpJsNativeMetadata>;
+	fsReadDir(path: string): Promise<string[]>;
+	fsCanonicalPath(path: string): Promise<string>;
+	fsMakeDir(path: string, recursive: boolean): Promise<void>;
+	fsRemove(path: string, recursive: boolean): Promise<void>;
+	fsRename(from: string, to: string): Promise<void>;
+	fsExists(path: string): Promise<boolean>;
 	close(): unknown;
-	uniffiDestroy(): void;
+	uniffiDestroy?(): void;
+}
+
+const MODE_TYPE_MASK = 0o170000;
+const MODE_DIRECTORY = 0o040000;
+const MODE_SYMLINK = 0o120000;
+const MODE_FILE = 0o100000;
+
+/** Bytes requested per native call while scanning a text file line by line. */
+export const MCP_JS_LINE_READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Map a native failure to a backend-independent code. The native error message is
+ * the guest wrapper's message, so the Node-style code tokens are the contract; the
+ * generated binding's error shape (class fields versus `inner`) is not.
+ */
+export function nativeFileErrorCode(error: unknown): FileErrorCode {
+	let text = String(error);
+	try {
+		text += ` ${JSON.stringify(error)}`;
+	} catch {
+		/* Unserializable errors still carry their message. */
+	}
+	if (/\bENOENT\b/.test(text)) return "not_found";
+	if (/ denied by |\bEACCES\b|\bEPERM\b/.test(text)) return "permission_denied";
+	if (/\bENOTDIR\b/.test(text)) return "not_directory";
+	if (/\bEISDIR\b/.test(text)) return "is_directory";
+	if (/invalid UTF-8|\bEINVAL\b/.test(text)) return "invalid";
+	if (/\bENOSYS\b|not supported|not configured/.test(text)) return "not_supported";
+	return "unknown";
+}
+
+function toArrayBuffer(content: string | Uint8Array): ArrayBuffer {
+	const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function nativeMessage(error: unknown): string {
+	if (error instanceof Error && error.message) return error.message;
+	const inner = (error as { inner?: { message?: unknown } } | null)?.inner;
+	if (inner && typeof inner.message === "string") return inner.message;
+	return String(error);
 }
 
 /**
  * Owns a native Engine created with createWithFilesystem. Do not share the Engine
- * with other callers. Guest heaps are stateless; policy-gated host files persist.
- * Cancellation is checked before dispatch and after settlement, not mid-execution.
- * Native execution deadlines bound in-flight work; cleanup waits for it to settle.
+ * with other callers. Guest heaps are stateless; hook-gated host files persist.
+ * File operations are typed native calls that run through the engine's hook
+ * chain; they never evaluate JavaScript or fall back to Node's filesystem.
+ * Cancellation is checked before dispatch and after settlement, not mid-call;
+ * native execution deadlines bound in-flight JavaScript, and cleanup waits for
+ * all in-flight work to settle.
  */
 export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 	readonly cwd: string;
 	private readonly engine: McpJsNativeEngine;
 	private pending: Promise<void> = Promise.resolve();
+	private readonly inflight = new Set<Promise<unknown>>();
 	private closed = false;
 
 	constructor(engine: McpJsNativeEngine, cwd: string) {
 		if (!posix.isAbsolute(cwd)) throw new Error("mcp-js cwd must be an absolute POSIX path");
+		if (!engine.hostFilesystemEnabled()) {
+			throw new Error("mcp-js engine has no filesystem configuration; create it with createWithFilesystem");
+		}
 		this.engine = engine;
 		this.cwd = posix.normalize(cwd);
 	}
@@ -65,35 +142,52 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		return posix.resolve(this.cwd, path);
 	}
 
+	/** Run one native file operation with abort checks and error mapping. */
 	private async file<T>(path: string, context: Context, operation: () => Promise<T>): Promise<Result<T, FileError>> {
+		const absolute = this.path(path);
+		if (this.closed) return err(new FileError("not_supported", "mcp-js environment is closed", absolute));
+		if (context.abortSignal?.aborted) return err(new FileError("aborted", "Operation aborted", absolute));
+		const call = operation();
+		this.inflight.add(call);
 		try {
-			if (context.abortSignal?.aborted) return err(new FileError("aborted", "Operation aborted", path));
-			return ok(await operation());
+			const value = await call;
+			if (context.abortSignal?.aborted) return err(new FileError("aborted", "Operation aborted", absolute));
+			return ok(value);
 		} catch (cause) {
-			const error = toError(cause);
-			const code = context.abortSignal?.aborted
-				? "aborted"
-				: /denied by policy|EACCES|EPERM/.test(error.message)
-					? "permission_denied"
-					: /ENOENT/.test(error.message)
-						? "not_found"
-						: /ENOTDIR/.test(error.message)
-							? "not_directory"
-							: /EISDIR/.test(error.message)
-								? "is_directory"
-								: "unknown";
-			return err(new FileError(code, error.message, path, error));
+			if (cause instanceof FileError) return err(cause);
+			const code = context.abortSignal?.aborted ? "aborted" : nativeFileErrorCode(cause);
+			return err(
+				new FileError(
+					code,
+					nativeMessage(cause),
+					absolute,
+					cause instanceof Error ? cause : new Error(String(cause)),
+				),
+			);
+		} finally {
+			this.inflight.delete(call);
 		}
 	}
 
-	private async evaluate(expression: string, context: Context): Promise<unknown> {
-		const result = await this.runJavaScript(
-			`console.log(JSON.stringify(await (async () => { ${expression} })()));`,
-			undefined,
-			context,
-		);
-		if (result.error) throw new Error(result.error);
-		return JSON.parse(result.output);
+	private async info(absolute: string): Promise<FileInfo> {
+		const stat = await this.engine.fsLstat(absolute);
+		const type = stat.mode & MODE_TYPE_MASK;
+		const kind =
+			type === MODE_SYMLINK
+				? "symlink"
+				: type === MODE_DIRECTORY
+					? "directory"
+					: type === MODE_FILE
+						? "file"
+						: undefined;
+		if (kind === undefined) throw new FileError("not_supported", `Unsupported file type at ${absolute}`, absolute);
+		return {
+			name: posix.basename(absolute),
+			path: absolute,
+			kind,
+			size: Number(stat.size),
+			mtimeMs: stat.modifiedMs ?? 0,
+		};
 	}
 
 	async absolutePath(path: string, context: Context): Promise<Result<string, FileError>> {
@@ -103,162 +197,152 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		return this.file(this.cwd, context, async () => posix.join(...parts));
 	}
 	async readTextFile(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.file(path, context, async () => {
-			const value = await this.evaluate(
-				`return await fs.readFile(${JSON.stringify(this.path(path))}, "utf8");`,
-				context,
-			);
-			if (typeof value !== "string") throw new Error("Invalid native text result");
-			return value;
-		});
+		return this.file(path, context, () => this.engine.fsReadTextFile(this.path(path)));
 	}
+	/**
+	 * Read lines through bounded native range reads, stopping once `maxLines` lines
+	 * are complete, so a large file is never loaded whole. Line breaks are `\n` or
+	 * `\r\n`; a trailing line break does not produce an empty final line.
+	 */
 	async readTextLines(
 		path: string,
 		options: { maxLines?: number } | undefined,
 		context: Context,
 	): Promise<Result<string[], FileError>> {
-		const result = await this.readTextFile(path, context);
-		return result.ok ? ok(result.value.split("\n").slice(0, options?.maxLines)) : result;
+		const maxLines = options?.maxLines;
+		if (maxLines !== undefined && maxLines <= 0) return ok([]);
+		return this.file(path, context, async () => {
+			const absolute = this.path(path);
+			const decoder = new TextDecoder("utf-8", { fatal: true });
+			const lines: string[] = [];
+			let carry = "";
+			let offset = 0n;
+			for (;;) {
+				if (context.abortSignal?.aborted) throw new FileError("aborted", "Operation aborted", absolute);
+				const chunk = new Uint8Array(
+					await this.engine.fsReadFileRange(absolute, offset, BigInt(MCP_JS_LINE_READ_CHUNK_BYTES)),
+				);
+				const atEnd = chunk.byteLength < MCP_JS_LINE_READ_CHUNK_BYTES;
+				offset += BigInt(chunk.byteLength);
+				try {
+					carry += decoder.decode(chunk, { stream: !atEnd });
+				} catch (cause) {
+					throw new FileError(
+						"invalid",
+						`Invalid UTF-8 in ${absolute}`,
+						absolute,
+						cause instanceof Error ? cause : undefined,
+					);
+				}
+				let newline = carry.indexOf("\n");
+				while (newline !== -1) {
+					lines.push(carry.slice(0, newline).replace(/\r$/, ""));
+					carry = carry.slice(newline + 1);
+					if (maxLines !== undefined && lines.length >= maxLines) return lines;
+					newline = carry.indexOf("\n");
+				}
+				if (atEnd) break;
+			}
+			if (carry.length > 0) lines.push(carry);
+			return lines;
+		});
 	}
 	async readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
-		return this.file(path, context, async () => {
-			const value = await this.evaluate(
-				`return Array.from(await fs.readFile(${JSON.stringify(this.path(path))}));`,
-				context,
-			);
-			if (
-				!Array.isArray(value) ||
-				!value.every(
-					(byte: unknown) => typeof byte === "number" && Number.isInteger(byte) && byte >= 0 && byte <= 255,
-				)
-			)
-				throw new Error("Invalid native binary result");
-			return Uint8Array.from(value);
-		});
+		return this.file(path, context, async () => new Uint8Array(await this.engine.fsReadFile(this.path(path))));
 	}
 	async writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.file(path, context, async () => {
 			const absolute = this.path(path);
-			const data =
-				typeof content === "string"
-					? JSON.stringify(content)
-					: `new Uint8Array(${JSON.stringify(Array.from(content))})`;
-			await this.evaluate(
-				`await fs.mkdir(${JSON.stringify(posix.dirname(absolute))}, { recursive: true }); await fs.writeFile(${JSON.stringify(absolute)}, ${data}); return null;`,
-				context,
-			);
+			await this.engine.fsMakeDir(posix.dirname(absolute), true);
+			await this.engine.fsWriteFile(absolute, toArrayBuffer(content));
 		});
 	}
 	async appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-		if (typeof content !== "string")
-			return err(new FileError("not_supported", "Native fs.appendFile does not support binary append", path));
 		return this.file(path, context, async () => {
 			const absolute = this.path(path);
-			await this.evaluate(
-				`await fs.mkdir(${JSON.stringify(posix.dirname(absolute))}, { recursive: true }); await fs.appendFile(${JSON.stringify(absolute)}, ${JSON.stringify(content)}); return null;`,
-				context,
-			);
+			await this.engine.fsMakeDir(posix.dirname(absolute), true);
+			await this.engine.fsAppendFile(absolute, toArrayBuffer(content));
 		});
 	}
 	async renameFile(source: string, destination: string, context: Context): Promise<Result<void, FileError>> {
-		return this.file(source, context, async () => {
-			await this.evaluate(
-				`await fs.rename(${JSON.stringify(this.path(source))}, ${JSON.stringify(this.path(destination))}); return null;`,
-				context,
-			);
-		});
+		return this.file(source, context, () => this.engine.fsRename(this.path(source), this.path(destination)));
 	}
 	async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
-		return this.file(path, context, async () => {
-			const absolute = this.path(path);
-			const value = await this.evaluate(
-				`const s = await fs.lstat(${JSON.stringify(absolute)}); return { kind: s.isSymbolicLink() ? "symlink" : s.isDirectory() ? "directory" : s.isFile() ? "file" : null, size: s.size, mtimeMs: s.mtimeMs };`,
-				context,
-			);
-			if (!value || typeof value !== "object") throw new Error("Invalid native stat");
-			const stat = value as Record<string, unknown>;
-			if (
-				(stat.kind !== "file" && stat.kind !== "directory" && stat.kind !== "symlink") ||
-				typeof stat.size !== "number" ||
-				typeof stat.mtimeMs !== "number"
-			)
-				throw new Error("Unsupported native stat");
-			return {
-				name: posix.basename(absolute),
-				path: absolute,
-				kind: stat.kind,
-				size: stat.size,
-				mtimeMs: stat.mtimeMs,
-			};
-		});
+		return this.file(path, context, () => this.info(this.path(path)));
 	}
 	async listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
 		return this.file(path, context, async () => {
-			const names = await this.evaluate(`return await fs.readdir(${JSON.stringify(this.path(path))});`, context);
-			if (!Array.isArray(names) || !names.every((name: unknown) => typeof name === "string"))
-				throw new Error("Invalid native directory listing");
+			const absolute = this.path(path);
+			const names = await this.engine.fsReadDir(absolute);
 			const files: FileInfo[] = [];
 			for (const name of names) {
-				const info = await this.fileInfo(posix.join(this.path(path), name), context);
-				if (!info.ok) throw info.error;
-				files.push(info.value);
+				if (context.abortSignal?.aborted) throw new FileError("aborted", "Operation aborted", absolute);
+				files.push(await this.info(posix.join(absolute, name)));
 			}
 			return files;
 		});
 	}
-	async canonicalPath(path: string, _context: Context): Promise<Result<string, FileError>> {
-		return err(new FileError("not_supported", "Native fs has no realpath operation", path));
+	async canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
+		return this.file(path, context, () => this.engine.fsCanonicalPath(this.path(path)));
 	}
 	async exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
-		const info = await this.fileInfo(path, context);
-		if (info.ok) return ok(true);
-		return info.error.code === "not_found" ? ok(false) : info;
+		return this.file(path, context, () => this.engine.fsExists(this.path(path)));
 	}
 	async createDir(
 		path: string,
 		options: { recursive?: boolean } | undefined,
 		context: Context,
 	): Promise<Result<void, FileError>> {
-		return this.file(path, context, async () => {
-			await this.evaluate(
-				`await fs.mkdir(${JSON.stringify(this.path(path))}, { recursive: ${options?.recursive ?? true} }); return null;`,
-				context,
-			);
-		});
+		return this.file(path, context, () => this.engine.fsMakeDir(this.path(path), options?.recursive ?? true));
 	}
 	async remove(
 		path: string,
 		options: { recursive?: boolean; force?: boolean } | undefined,
 		context: Context,
 	): Promise<Result<void, FileError>> {
-		const result = await this.file(path, context, async () => {
-			await this.evaluate(
-				`await fs.rm(${JSON.stringify(this.path(path))}, { recursive: ${options?.recursive ?? false} }); return null;`,
-				context,
-			);
-		});
+		const result = await this.file(path, context, () =>
+			this.engine.fsRemove(this.path(path), options?.recursive ?? false),
+		);
 		return !result.ok && options?.force && result.error.code === "not_found" ? ok(undefined) : result;
 	}
-	async createTempDir(_prefix: string | undefined, _context: Context): Promise<Result<string, FileError>> {
-		return err(new FileError("not_supported", "Native fs has no exclusive temporary directory operation"));
+	/**
+	 * Create a fresh directory under `cwd` using a non-recursive native mkdir, which
+	 * fails when the name already exists, so the directory is exclusively created.
+	 */
+	async createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
+		return this.file(this.cwd, context, async () => {
+			let lastError: unknown;
+			for (let attempt = 0; attempt < 8; attempt++) {
+				const candidate = posix.join(this.cwd, `${prefix ?? "tmp-"}${Math.random().toString(36).slice(2, 10)}`);
+				try {
+					await this.engine.fsMakeDir(candidate, false);
+					return candidate;
+				} catch (cause) {
+					lastError = cause;
+					if (!/\bEEXIST\b/.test(String(cause))) throw cause;
+				}
+			}
+			throw lastError;
+		});
 	}
 	async createTempFile(
 		_options: { prefix?: string; suffix?: string } | undefined,
 		_context: Context,
 	): Promise<Result<string, FileError>> {
-		return err(new FileError("not_supported", "Native fs has no exclusive temporary file operation"));
+		return err(new FileError("not_supported", "Native fs has no exclusive file creation operation"));
 	}
 	async cleanup(_context: Context): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
 		await this.pending;
+		await Promise.allSettled(this.inflight);
 		try {
 			this.engine.close();
 		} catch {
 			/* Best-effort native shutdown. */
 		}
 		try {
-			this.engine.uniffiDestroy();
+			this.engine.uniffiDestroy?.();
 		} catch {
 			/* Best-effort native handle release. */
 		}
