@@ -1,5 +1,5 @@
 import type { Context } from "../context.ts";
-import type { ExecutionEnv } from "../types.ts";
+import type { FileSystem } from "../types.ts";
 import { getOrThrow } from "../types.ts";
 
 type MutationQueueState = {
@@ -7,9 +7,9 @@ type MutationQueueState = {
 	registration: Promise<void>;
 };
 
-const states = new WeakMap<ExecutionEnv, MutationQueueState>();
+const states = new WeakMap<FileSystem, MutationQueueState>();
 
-function getState(env: ExecutionEnv): MutationQueueState {
+function getState(env: FileSystem): MutationQueueState {
 	let state = states.get(env);
 	if (!state) {
 		state = { queues: new Map(), registration: Promise.resolve() };
@@ -18,7 +18,7 @@ function getState(env: ExecutionEnv): MutationQueueState {
 	return state;
 }
 
-async function getMutationQueueKey(env: ExecutionEnv, path: string, context: Context): Promise<string> {
+async function getMutationQueueKey(env: FileSystem, path: string, context: Context): Promise<string> {
 	const absolutePath = getOrThrow(await env.absolutePath(path, context));
 	const canonicalPath = await env.canonicalPath(absolutePath, context);
 	if (canonicalPath.ok) return canonicalPath.value;
@@ -28,7 +28,7 @@ async function getMutationQueueKey(env: ExecutionEnv, path: string, context: Con
 
 /** Serialize file mutations targeting the same environment and canonical path. */
 export async function withFileMutationQueue<T>(
-	env: ExecutionEnv,
+	env: FileSystem,
 	path: string,
 	fn: () => Promise<T>,
 	context: Context,

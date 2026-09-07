@@ -3,7 +3,7 @@ import type { AgentHarnessTool } from "../types.ts";
 import { getOrThrow } from "../types.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToolPath } from "./path-utils.ts";
-import type { ExecutionToolContext } from "./tool-context.ts";
+import type { FileToolContext } from "./tool-context.ts";
 
 const writeSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
@@ -12,7 +12,7 @@ const writeSchema = Type.Object({
 
 export type WriteToolInput = Static<typeof writeSchema>;
 
-export function createWriteTool<TContext extends ExecutionToolContext = ExecutionToolContext>(): AgentHarnessTool<
+export function createWriteTool<TContext extends FileToolContext = FileToolContext>(): AgentHarnessTool<
 	TContext,
 	typeof writeSchema,
 	undefined

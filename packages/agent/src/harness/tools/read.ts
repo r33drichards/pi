@@ -12,7 +12,7 @@ import {
 } from "../utils/truncate.ts";
 import { detectSupportedImageMimeType, encodeBase64 } from "./image.ts";
 import { resolveReadToolPath } from "./path-utils.ts";
-import type { ExecutionToolContext } from "./tool-context.ts";
+import type { FileToolContext } from "./tool-context.ts";
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
@@ -44,7 +44,7 @@ export interface ReadToolOptions {
 	imageProcessor?: ReadImageProcessor;
 }
 
-export function createReadTool<TContext extends ExecutionToolContext = ExecutionToolContext>(
+export function createReadTool<TContext extends FileToolContext = FileToolContext>(
 	options?: ReadToolOptions,
 ): AgentHarnessTool<TContext, typeof readSchema, ReadToolDetails | undefined> {
 	return {
@@ -123,7 +123,7 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 			let details: ReadToolDetails | undefined;
 			if (truncation.firstLineExceedsLimit) {
 				const firstLineSize = formatSize(new TextEncoder().encode(allLines[startLine]).byteLength);
-				outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+				outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use an available execution tool to read a smaller byte slice of this line.]`;
 				details = { truncation };
 			} else if (truncation.truncated) {
 				const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
