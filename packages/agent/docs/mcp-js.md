@@ -1,5 +1,8 @@
 # Native mcp-js execution environment (experimental)
 
+This page describes the existing prototype. See [Direct native filesystem design](mcp-js-design.md)
+for the proposed replacement and the verified upstream dependency state as of 2026-09-07.
+
 The harness can use JavaScript instead of Bash without changing the file tool
 schemas. `FileToolContext` requires only `FileSystem`; `JavaScriptRuntime` is a
 separate execution capability, not a reinterpretation of `Shell.exec`.
