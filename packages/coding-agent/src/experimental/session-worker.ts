@@ -973,5 +973,11 @@ if (isDirectInternalProcessEntry(import.meta.url)) {
 	if (role !== "session-worker") {
 		throw new Error("Session worker entrypoint requires an internal session-worker invocation");
 	}
-	void runSessionWorkerProcess(process.argv.slice(2)).catch(() => process.exit(1));
+	void runSessionWorkerProcess(process.argv.slice(2)).catch((error: unknown) => {
+		// The server only relays "Internal server error"; the cause must reach the logs.
+		console.error(
+			`Session worker failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+		);
+		process.exit(1);
+	});
 }
