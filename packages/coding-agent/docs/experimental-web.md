@@ -1,6 +1,6 @@
 # Sessions-only web UI on the experimental server
 
-Date: 2026-09-07. Status: agreed, not yet implemented.
+Date: 2026-09-07. Status: implemented under `packages/coding-agent/src/experimental/web/`.
 
 ## Goal
 
@@ -26,14 +26,17 @@ fork pi-web.
 
 ## Process layout
 
-New package `packages/web` (`@earendil-works/pi-web-sessions`, private,
-development-only like `client` and `server`). One command:
+Everything lives in `packages/coding-agent/src/experimental/web/`, next to
+the terminal client, and is development-only like the rest of the
+experimental tree (excluded from the published build). One command:
 
     PI_EXPERIMENTAL=1 pi web [--port 8600] [--host 127.0.0.1] [--token <t>]
 
 `pi web` starts the foreground experimental server in-process (the same
-`startForegroundServer` that `pi server` uses), then an HTTP server that
-serves the bundled app and accepts WebSocket upgrades at `/ws`. Each WebSocket
+`startForegroundServer` that `pi server` uses), bundles the app with esbuild
+into a temporary directory, then starts an HTTP server that serves it and
+accepts WebSocket upgrades at `/ws` (`web/run.ts`, `web/build.ts`,
+`web/gateway.ts`). Each WebSocket
 is a byte relay to the server's Unix socket: one Unix connection per browser
 connection, bytes copied both ways, close propagated both ways. The gateway
 does not decode the protocol, so `pi-server` and `pi-protocol` are unchanged.
@@ -48,13 +51,18 @@ Auth in v1: bind `127.0.0.1`; when `--token` is given, the upgrade must carry
 
 ## Browser app
 
-Plain TypeScript, bundled with esbuild (already a repo dependency) into
-`packages/web/dist/public/`. `lit` is the only new dependency, used for
-templating so per-delta transcript updates re-render cheaply.
+Plain TypeScript in `web/app/`, bundled with esbuild (already a repo
+dependency). `lit` is the only new dependency, used for templating so
+per-delta transcript updates re-render cheaply. The app directory has its own
+`tsconfig.json` with the DOM lib and is excluded from the root program;
+`npm run check:experimental-web` typechecks it. `activateBuiltinClientServices`
+moved to the browser-safe `client-services.ts` so the terminal client and the
+app share it.
 
-Startup: open a WebSocket to `/ws`, wrap it as a `ByteTransportFactory`,
-`Client.connect`, build `ServerServiceSource` and `SessionServiceSource`
-exactly as `openClientRuntime` does, then `activateBuiltinClientServices`.
+Startup (`web/app/runtime.ts`): fetch `/api/server` for the server id, open a
+WebSocket to `/ws` wrapped as a `ByteTransportFactory`, `Client.connect`,
+build `ServerServiceSource` and `SessionServiceSource` exactly as
+`openClientRuntime` does, then `activateBuiltinClientServices`.
 
 Regions:
 
@@ -86,15 +94,27 @@ Regions:
 
 ## Testing
 
-- Relay unit tests (vitest, Node): bytes pass in both directions across
-  fragmentation; wrong or missing token gets 401; closing either side closes
-  the other.
-- The app entry is added to `scripts/browser-smoke-entry.ts` so a Node-only
-  import in any module it pulls in fails `npm run check`.
-- Composer command parsing has unit tests.
-- One scripted Playwright run against `pi web`: create a session, send a
-  prompt that writes and reads a file through `run_js`, assert the `run_js`
-  card and final answer render.
+- `test/experimental-web-gateway.test.ts`: bytes pass in both directions;
+  wrong or missing token gets 401; only `/ws` upgrades; closing either side
+  closes the other; static files cannot escape the app directory.
+- `test/experimental-web-build.test.ts`: the bundle builds for the browser and
+  contains no Node builtin imports.
+- `test/experimental-web-commands.test.ts`: composer command parsing and
+  completion. `test/experimental-cli-resolution.test.ts` covers `pi web`
+  options.
+- Verified by hand with Playwright against `pi web` started from a directory
+  with an `mcpJs` coordinator setting: create a session, prompt, `run_js`
+  writes `/notes.txt`, `read` returns it, the final answer renders, no
+  console errors.
+
+## Notes
+
+- The sidebar lists every session in the server's session directory, which
+  is shared by all experimental servers on the machine, not only sessions
+  created from the browser.
+- Model, thinking, compact, and reload are available both as toolbar
+  controls and as `/model`, `/thinking`, `/compact`, `/reload` in the
+  composer, with a completion popup while typing a command.
 
 ## Not in v1
 

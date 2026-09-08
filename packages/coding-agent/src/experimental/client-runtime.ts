@@ -4,20 +4,17 @@ import { Client, ServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory, discoverUnixServers, type UnixServerRoute } from "@earendil-works/pi-client/unix";
 import { isServerId, type ServerId } from "@earendil-works/pi-protocol";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
+import type { ActivatedClientServices } from "./client-services.ts";
 import { RadiusRelayAuthResolver } from "./radius-auth.ts";
 import { createRadiusClientTransportFactory, RadiusClientReconnect } from "./radius-relay.ts";
 import { activateServer, ENV_SERVER_ID, resolveServerDirectory, resolveSessionDirectory } from "./server.ts";
-import { AgentController } from "./services/agent-controller.ts";
 import {
 	createServerServiceSource,
 	createSessionServiceSource,
 	type ServerServiceSource,
 	type SessionServiceSource,
 } from "./services/connection.ts";
-import { Models } from "./services/models.ts";
-import { PresentationPlugins } from "./services/plugins.ts";
-import { SessionDirectory, SessionManagement } from "./services/sessions.ts";
-import { Transcript } from "./services/transcript.ts";
+import { SessionManagement } from "./services/sessions.ts";
 
 export type ClientRuntimeRoute =
 	| ({ readonly transport: "unix" } & UnixServerRoute)
@@ -30,14 +27,9 @@ export interface ClientRuntimeServer {
 	readonly session: SessionServiceSource;
 }
 
-export interface ActivatedClientRuntimeServer extends ClientRuntimeServer {
-	readonly directory: SessionDirectory;
-	readonly management: SessionManagement;
-	readonly plugins: PresentationPlugins;
-	readonly models: Models;
-	readonly agent: AgentController;
-	readonly transcript: Transcript;
-}
+export type ActivatedClientRuntimeServer = ClientRuntimeServer & ActivatedClientServices;
+
+export { activateBuiltinClientServices } from "./client-services.ts";
 
 export interface ClientRuntime {
 	readonly servers: readonly ClientRuntimeServer[];
@@ -180,46 +172,6 @@ export async function openClientRuntime(
 		}
 		throw error;
 	}
-}
-
-/** Acquire and connect the built-in service facades used by the non-interactive client. */
-export async function activateBuiltinClientServices(
-	server: ClientRuntimeServer,
-): Promise<ActivatedClientRuntimeServer> {
-	const serverServices = server.server.open({
-		services: [SessionDirectory, SessionManagement, PresentationPlugins],
-		assertAccess() {},
-		onError() {},
-	});
-	const sessionServices = server.session.open({
-		services: [Models, AgentController, Transcript],
-		assertAccess() {},
-		onError() {},
-	});
-	const directory = serverServices.use(SessionDirectory);
-	const remoteManagement = serverServices.use(SessionManagement);
-	const management: SessionManagement = {
-		create: (options, context) => remoteManagement.create(options, context),
-		async remove(sessionId, context) {
-			const removesCurrentAttachment = server.client.attachment?.sessionId === sessionId;
-			await remoteManagement.remove(sessionId, context);
-			if (removesCurrentAttachment) await server.session.whenDetached(context);
-		},
-		async attach(sessionId, context) {
-			await remoteManagement.attach(sessionId, context);
-			await server.session.whenAttached(sessionId, context);
-		},
-		async detach(context) {
-			await remoteManagement.detach(context);
-			await server.session.whenDetached(context);
-		},
-	};
-	const plugins = serverServices.use(PresentationPlugins);
-	const models = sessionServices.use(Models);
-	const agent = sessionServices.use(AgentController);
-	const transcript = sessionServices.use(Transcript);
-	await Promise.all([serverServices.ready(BACKGROUND_CONTEXT), sessionServices.ready(BACKGROUND_CONTEXT)]);
-	return { ...server, directory, management, plugins, models, agent, transcript };
 }
 
 function routeFromExplicitPath(path: string): UnixServerRoute {
