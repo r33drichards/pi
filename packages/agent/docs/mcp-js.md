@@ -171,8 +171,21 @@ Standalone: the worker embeds the engine through generated native bindings.
 JSON object for the `filesystem` entry. `heap` and `snapshots` default to
 true; `wasmModules` (name to `.wasm` path) pre-loads modules and, because an
 engine cannot have both, turns the heap store off. `snapshotCwd` (default
-`/work`) is the file tools' working directory inside the snapshot; `files:
-"host"` keeps them on the host filesystem instead.
+`/`) is the file tools' working directory inside the snapshot; a new session's
+snapshot is empty, so its root is the natural place to start. `files: "host"`
+keeps the file tools on the host filesystem instead.
+
+Every mcp-js session starts in a fresh directory of its own: the session
+snapshot for `files: "session"`, and `<agentDir>/mcp-js/sessions/<sessionId>`
+on the host for `files: "host"` and for the session store. The directory the pi
+server was started from only supplies the settings that selected mcp-js.
+
+The `run_js` tool description carries the environment's `runtimeDescription`:
+that mcp-js is a bare V8 sandbox without `process`, `require`, `import`, or a
+`Deno` namespace, that `globalThis.fs` is the only I/O and shares the file
+tools' filesystem, where relative paths resolve, and whether `globalThis`
+persists between runs. Without it a model has to discover the runtime by
+trial and error on its first turn.
 
 Coordinator: the worker talks to an mcp-js HTTP server or cluster over
 `McpJsHttpEngine`. `run_js` is submitted to `/api/exec` with the session
@@ -197,6 +210,13 @@ a blob store.
 For an embedding that builds its own environment, `runSessionWorkerWithHarness`
 still takes a factory `(cwd, sessionId) => environment`, and
 `createMcpJsEnvironmentFactory` accepts injected loaders for tests.
+
+## Root of the session snapshot
+
+The HTTP server has no entry route for the snapshot root, so `McpJsHttpEngine`
+answers `stat`, `lstat`, and `exists` for `/` itself: the root always exists,
+and reading it is an `is_directory` error. Directory listings of the root go
+to the server's `dir` endpoint without a path.
 
 ## Verification
 

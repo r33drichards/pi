@@ -122,7 +122,7 @@ export interface McpJsSettings {
 	headers?: Record<string, string>;
 	/** Which namespace the file tools address: the session snapshot, or the host filesystem. */
 	files?: "session" | "host";
-	/** Working directory inside the session snapshot (default: `/work`). */
+	/** Working directory inside the session snapshot (default: `/`, the root of the initially empty snapshot). */
 	snapshotCwd?: string;
 }
 

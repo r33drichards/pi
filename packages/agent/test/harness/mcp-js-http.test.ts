@@ -69,10 +69,12 @@ function server(options: { filesystem?: boolean } = {}) {
 				if (!file) return json({ error: `fs.lstat: ${path}: ENOENT`, kind: "not_found" }, 404);
 				return json({ kind: "file", size: file.byteLength, readonly: false, mode: 0o100644, modified_ms: 5 });
 			}
-			case "dir":
+			case "dir": {
+				const prefix = path === "/" ? "/" : `${path}/`;
 				return json({
-					names: [...files.keys()].filter((f) => f.startsWith(`${path}/`)).map((f) => f.slice(path.length + 1)),
+					names: [...files.keys()].filter((f) => f.startsWith(prefix)).map((f) => f.slice(prefix.length)),
 				});
+			}
 			case "fs": {
 				const body = JSON.parse(String(init.body)) as { op: string; path: string; to?: string };
 				const target = `/${body.path.replace(/^\/+/, "")}`;
@@ -174,6 +176,29 @@ describe("mcp-js HTTP engine (coordinator mode)", () => {
 		expect(fake.calls.some((call) => call.path.includes("/api/sessions/pi-1/files/work/blob.bin?append=true"))).toBe(
 			true,
 		);
+	});
+
+	it("serves the snapshot root without a server round trip", async () => {
+		const fake = server();
+		const engine = await McpJsHttpEngine.connect({ url: "http://node1:3000", fetch: fake.fetch });
+		const env = new McpJsExecutionEnv(engine, "/", { session: "pi-root" });
+		// A fresh session is an empty snapshot whose root always exists.
+		expect(await env.fileInfo(".", BACKGROUND_CONTEXT)).toEqual({
+			ok: true,
+			value: { name: "", path: "/", kind: "directory", size: 0, mtimeMs: 0 },
+		});
+		expect(await env.exists("/", BACKGROUND_CONTEXT)).toEqual({ ok: true, value: true });
+		const empty = await env.listDir(".", BACKGROUND_CONTEXT);
+		expect(empty.ok && empty.value).toEqual([]);
+		expect(fake.calls.some((call) => /\/api\/sessions\/pi-root\/entries\/?(\?|$)/.test(call.path))).toBe(false);
+		expect(fake.calls.some((call) => call.path.endsWith("/api/sessions/pi-root/dir"))).toBe(true);
+		// Files resolve against the root, and reading the root itself is a directory error.
+		expect(await env.writeFile("notes.txt", "hi", BACKGROUND_CONTEXT)).toEqual({ ok: true, value: undefined });
+		expect(fake.files.get("/notes.txt")).toEqual(new TextEncoder().encode("hi"));
+		const listing = await env.listDir("/", BACKGROUND_CONTEXT);
+		expect(listing.ok && listing.value.map((entry) => entry.name)).toEqual(["notes.txt"]);
+		const root = await env.readTextFile("/", BACKGROUND_CONTEXT);
+		expect(!root.ok && root.error.code).toBe("is_directory");
 	});
 
 	it("cancels a remote execution when the caller aborts", async () => {

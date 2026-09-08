@@ -9,7 +9,7 @@
  * session files stay on the host.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { FileSystem } from "@earendil-works/pi-agent-core";
@@ -75,7 +75,8 @@ export interface McpJsEnvironmentDependencies {
 
 const DEFAULT_HEAP_MB = 256;
 const DEFAULT_TIMEOUT_SECS = 60;
-const DEFAULT_SNAPSHOT_CWD = "/work";
+/** A session snapshot starts empty, so the file tools work from its root. */
+const DEFAULT_SNAPSHOT_CWD = "/";
 
 function isBindingsModule(value: unknown): value is McpJsBindingsModule {
 	if (!value || typeof value !== "object") return false;
@@ -137,6 +138,18 @@ function standaloneEngine(bindings: McpJsBindingsModule, settings: McpJsSettings
 }
 
 /**
+ * Each mcp-js session starts in a fresh directory of its own on the host rather
+ * than in the directory the pi server happened to be started from: it is the
+ * working directory for `files: "host"` and for the session store. Settings are
+ * still read from the server's directory, which is what selected mcp-js.
+ */
+export function sessionHostDir(agentDir: string, sessionId: string): string {
+	const dir = join(agentDir, "mcp-js", "sessions", sessionId);
+	mkdirSync(dir, { recursive: true });
+	return dir;
+}
+
+/**
  * Build the session worker's environment factory. With no `mcpJs` setting the
  * worker keeps the Node shell environment.
  */
@@ -164,9 +177,10 @@ export function createMcpJsEnvironmentFactory(
 			throw new Error(`mcpJs.mode must be "standalone" or "coordinator", not ${JSON.stringify(settings.mode)}`);
 		}
 		const files = settings.files ?? (engine.capabilities().filesystem ? "session" : "host");
-		const snapshotCwd = files === "session" ? (settings.snapshotCwd ?? DEFAULT_SNAPSHOT_CWD) : cwd;
-		const execution = new McpJsExecutionEnv(engine, snapshotCwd, { session: sessionId, files });
-		const sessionStore: FileSystem = new NodeExecutionEnv({ cwd });
+		const hostDir = sessionHostDir(agentDir, sessionId);
+		const executionCwd = files === "session" ? (settings.snapshotCwd ?? DEFAULT_SNAPSHOT_CWD) : hostDir;
+		const execution = new McpJsExecutionEnv(engine, executionCwd, { session: sessionId, files });
+		const sessionStore: FileSystem = new NodeExecutionEnv({ cwd: hostDir });
 		return { execution, sessionStore };
 	};
 }

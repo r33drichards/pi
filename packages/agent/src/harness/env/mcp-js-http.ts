@@ -45,6 +45,9 @@ async function failure(response: Response): Promise<HttpFailure> {
 	return new HttpFailure(response.status, message, kind);
 }
 
+/** Unix mode bits of a world-readable directory, `drwxr-xr-x`. */
+const ROOT_DIRECTORY_MODE = 0o040755;
+
 function encodePath(path: string): string {
 	return path
 		.replace(/^\/+/, "")
@@ -74,6 +77,11 @@ class HttpFsView implements McpJsNativeFsView {
 		return `${base}${encoded ? `/${encoded}` : ""}${search}`;
 	}
 
+	/** The snapshot root has no entry route on the server, and it always exists. */
+	private static isRoot(path: string): boolean {
+		return path.replace(/^\/+/, "").length === 0;
+	}
+
 	private async op(body: Record<string, unknown>): Promise<Record<string, unknown>> {
 		const response = await this.engine.request(this.url("fs"), {
 			method: "POST",
@@ -85,11 +93,13 @@ class HttpFsView implements McpJsNativeFsView {
 	}
 
 	async readFile(path: string): Promise<ArrayBuffer> {
+		if (HttpFsView.isRoot(path)) throw new Error(`fs.readFile: /: EISDIR: illegal operation on a directory`);
 		const response = await this.engine.request(this.url("files", path));
 		if (!response.ok) throw await failure(response);
 		return response.arrayBuffer();
 	}
 	async readFileRange(path: string, offset: bigint, maxBytes: bigint): Promise<ArrayBuffer> {
+		if (HttpFsView.isRoot(path)) throw new Error(`fs.readFile: /: EISDIR: illegal operation on a directory`);
 		const response = await this.engine.request(
 			this.url("files", path, { offset: offset.toString(), max_bytes: maxBytes.toString() }),
 		);
@@ -116,6 +126,8 @@ class HttpFsView implements McpJsNativeFsView {
 		if (!response.ok) throw await failure(response);
 	}
 	private async entry(path: string, follow: boolean): Promise<McpJsNativeMetadata> {
+		if (HttpFsView.isRoot(path))
+			return { mode: ROOT_DIRECTORY_MODE, size: 0, readonly: false, modifiedMs: undefined };
 		const response = await this.engine.request(this.url("entries", path, { follow: String(follow) }));
 		if (!response.ok) throw await failure(response);
 		const entry = (await response.json()) as { mode: number; size: number; readonly: boolean; modified_ms?: number };
@@ -154,6 +166,7 @@ class HttpFsView implements McpJsNativeFsView {
 		await this.op({ op: "rename", path: from, to });
 	}
 	async exists(path: string): Promise<boolean> {
+		if (HttpFsView.isRoot(path)) return true;
 		return (await this.op({ op: "exists", path })).exists as boolean;
 	}
 }

@@ -213,6 +213,10 @@ describe("native mcp-js adapter boundary (not a native engine test)", () => {
 			undefined,
 		);
 		expect(createRunJsTool().name).toBe("run_js");
+		expect(env.runtimeDescription).toContain("globalThis.fs");
+		expect(env.runtimeDescription).toContain("/work");
+		expect(createRunJsTool({ runtimeDescription: env.runtimeDescription }).description).toContain("globalThis.fs");
+		expect(createRunJsTool().description).not.toContain("globalThis.fs");
 		expect(engine.viewRequests).toEqual([undefined]);
 	});
 

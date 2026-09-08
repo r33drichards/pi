@@ -134,6 +134,25 @@ function nativeMessage(error: unknown): string {
 }
 
 /**
+ * The guest contract the model needs before its first `run_js` call: mcp-js is
+ * a bare V8 sandbox, not Node or Deno, and its only I/O is the `fs` global over
+ * the same filesystem the read and write tools see.
+ */
+export function describeMcpJsRuntime(cwd: string, files: "host" | "session", heap: boolean): string {
+	const where =
+		files === "session"
+			? `an isolated per-session filesystem that starts empty; the read and write tools see the same files`
+			: `the host filesystem as allowed by policy; the read and write tools see the same files`;
+	return [
+		`Runtime: the mcp-js V8 sandbox. It is not Node.js or Deno: there is no process, require, import, Buffer, Deno namespace, network, timers beyond the run, or shell.`,
+		`Filesystem: globalThis.fs (readFile, writeFile, appendFile, readdir, stat, lstat, mkdir, rm, rmdir, unlink, rename, copyFile, readlink, exists) over ${where}. Paths are POSIX; use absolute paths, and note the file tools resolve relative paths against ${cwd}. Example: await fs.writeFile('${posix.join(cwd, "out.txt")}', 'hi'); console.log(await fs.readFile('${posix.join(cwd, "out.txt")}', 'utf8')).`,
+		heap
+			? `State: globalThis persists between run_js calls in this session (the V8 heap is saved after each run), so variables you define stay available.`
+			: `State: each run_js call starts from a fresh heap; nothing on globalThis survives between calls.`,
+	].join(" ");
+}
+
+/**
  * Owns a native Engine. Do not share the Engine with other callers. File
  * operations are typed native calls that run through the engine's hook chain;
  * they never evaluate JavaScript or fall back to Node's filesystem. With a
@@ -146,6 +165,8 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 	readonly cwd: string;
 	readonly session: string | undefined;
 	readonly files: "host" | "session";
+	/** The mcp-js guest contract, for the `run_js` tool description. */
+	readonly runtimeDescription: string;
 	private readonly engine: McpJsNativeEngine;
 	private readonly view: McpJsNativeFsView;
 	private pending: Promise<void> = Promise.resolve();
@@ -173,6 +194,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		this.session = binding.session;
 		this.files = files;
 		this.view = engine.fsView(files === "session" ? binding.session : undefined);
+		this.runtimeDescription = describeMcpJsRuntime(this.cwd, files, capabilities.heap);
 	}
 
 	async runJavaScript(code: string, timeout: number | undefined, context: Context): Promise<JavaScriptResult> {

@@ -9,16 +9,22 @@ const schema = Type.Object({
 });
 export type RunJsToolInput = Static<typeof schema>;
 
-export function createRunJsTool<TContext extends JavaScriptToolContext = JavaScriptToolContext>(): AgentHarnessTool<
-	TContext,
-	typeof schema,
-	TruncationResult | undefined
-> {
+export interface RunJsToolOptions {
+	/** The runtime's own description of its globals and paths, usually `env.runtimeDescription`. */
+	runtimeDescription?: string;
+}
+
+const BASE_DESCRIPTION =
+	"Execute JavaScript in the configured runtime, awaiting promises. Use console.log for output and fs methods for policy-controlled filesystem access. Use absolute paths. This is not Bash; no shell or subprocess capability is implied. Output is limited to the last 2000 lines or 50KB.";
+
+export function createRunJsTool<TContext extends JavaScriptToolContext = JavaScriptToolContext>(
+	options: RunJsToolOptions = {},
+): AgentHarnessTool<TContext, typeof schema, TruncationResult | undefined> {
+	const runtime = options.runtimeDescription?.trim();
 	return {
 		name: "run_js",
 		label: "run_js",
-		description:
-			"Execute JavaScript in the configured runtime, awaiting promises. Use console.log for output and fs methods for policy-controlled filesystem access. Use absolute paths. This is not Bash; no shell or subprocess capability is implied. Output is limited to the last 2000 lines or 50KB.",
+		description: runtime ? `${BASE_DESCRIPTION}\n\n${runtime}` : BASE_DESCRIPTION,
 		parameters: schema,
 		async execute(_id, { code, timeout }, _update, { env }, _invocation, context) {
 			if (timeout !== undefined && (!Number.isInteger(timeout) || timeout < 1 || timeout > 300)) {

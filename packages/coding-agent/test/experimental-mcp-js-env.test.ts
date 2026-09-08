@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpJsNativeEngine, McpJsNativeFsView } from "@earendil-works/pi-agent-core/node";
@@ -100,8 +100,14 @@ describe("mcpJs settings select the session worker environment", () => {
 		const env = created.execution as McpJsExecutionEnv;
 		expect(env.session).toBe("session-1");
 		expect(env.files).toBe("session");
-		expect(env.cwd).toBe("/work");
+		// The session snapshot starts empty, so the file tools work from its root.
+		expect(env.cwd).toBe("/");
+		expect(env.runtimeDescription).toContain("globalThis.fs");
 		expect(created.sessionStore).toBeInstanceOf(NodeExecutionEnv);
+		// The host side of the session is a fresh empty directory, not the server's cwd.
+		const hostDir = join(agentDir, "mcp-js", "sessions", "session-1");
+		expect((created.sessionStore as NodeExecutionEnv).cwd).toBe(hostDir);
+		expect(readdirSync(hostDir)).toEqual([]);
 	});
 
 	it("assembles a standalone engine from the settings with the generated builders", async () => {
@@ -157,7 +163,10 @@ describe("mcpJs settings select the session worker environment", () => {
 		if (!("execution" in created)) throw new Error("expected environments");
 		const env = created.execution as McpJsExecutionEnv;
 		expect(env.files).toBe("host");
-		expect(env.cwd).toBe("/repo");
+		// Host-file sessions also start in a fresh empty directory of their own.
+		const hostDir = join(agentDir, "mcp-js", "sessions", "session-3");
+		expect(env.cwd).toBe(hostDir);
+		expect(existsSync(hostDir)).toBe(true);
 	});
 
 	it("rejects incomplete settings clearly", async () => {

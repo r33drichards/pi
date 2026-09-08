@@ -594,7 +594,7 @@ export function createSessionWorkerTools(
 	return [
 		createReadTool<JavaScriptToolContext>(),
 		createWriteTool<JavaScriptToolContext>(),
-		createRunJsTool(),
+		createRunJsTool({ runtimeDescription: env.runtimeDescription }),
 	] as AgentHarnessTool<{ env: SessionWorkerExecutionEnv }>[];
 }
 
