@@ -3,14 +3,12 @@ import { cli } from "../cli/experimental/cli.ts";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import type { IrcCommand } from "../cli/experimental/commands/irc.ts";
 import type { ServerCommand } from "../cli/experimental/commands/server.ts";
-import type { WebCommand } from "../cli/experimental/commands/web.ts";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.ts";
 import { runClient } from "./client.ts";
 import { runClientTui } from "./client-tui.ts";
 import { runIrcPresentation } from "./irc/run.ts";
 import type { RadiusRelayHostStatus } from "./radius-relay.ts";
 import { startForegroundServer } from "./server.ts";
-import { runWebGateway } from "./web/run.ts";
 
 async function runServerCommand(command: ServerCommand): Promise<void> {
 	let previousRelayStatus = "";
@@ -95,13 +93,12 @@ async function runClientCommand(command: ClientCommand): Promise<void> {
 
 /** Development-only command dispatch. Published entrypoints must not import this module. */
 export async function runExperimentalCommand(args: string[]): Promise<boolean> {
-	const commands = new Set(["server", "client", "web", "irc"]);
+	const commands = new Set(["server", "client", "irc"]);
 	if (!areExperimentalFeaturesEnabled() || args[0] === undefined || !commands.has(args[0])) return false;
 	try {
 		const result = await cli.execute(args, {
 			runServer: runServerCommand,
 			runClient: runClientCommand,
-			runWeb: (command: WebCommand) => runWebGateway(command, startForegroundServer),
 			runIrc: (command: IrcCommand) => runIrcPresentation(command, startForegroundServer),
 		});
 		if (!result.ok) {

@@ -1,9 +1,0 @@
-node_modules
-packages/*/node_modules
-packages/*/dist
-packages/session-backends/*/node_modules
-packages/session-backends/*/dist
-packages/coding-agent/examples/extensions/*/node_modules
-.git
-docker/web/data
-.env

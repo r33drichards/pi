@@ -8,7 +8,7 @@ sessions are whatever the server's settings select: started from a directory
 whose `mcpJs` setting names a coordinator, each channel is an mcp-js sandbox
 with `read`, `write`, and `run_js` on its own empty filesystem snapshot.
 
-    PI_EXPERIMENTAL=1 ./pi-test.sh irc --server irc.example --port 6667 --nick pi [--web-port 8600]
+    PI_EXPERIMENTAL=1 ./pi-test.sh irc --server irc.example --port 6667 --nick pi
 
 ## Talking to it
 
@@ -32,12 +32,12 @@ may omit the `#` (`ptest2` means `#ptest2`) and lists are comma separated.
 `,help` lists all of them.
 
 Session commands act on the channel's own Session and are the same set the
-browser composer has as `/model`, `/thinking`, `/compact`, `/reload`
-(shared parser in `session-commands.ts`):
+terminal client has as `/model`, `/thinking`, `/compact`, `/reload`
+(parser in `session-commands.ts`):
 
 | Command | Effect |
 | --- | --- |
-| `,model [query]` | No query: show the current model and the available ones. With a query: select the first model whose `provider/id name` contains it (case-insensitive), the same filter as the web picker. |
+| `,model [query]` | No query: show the current model and the available ones. With a query: select the first model whose `provider/id name` contains it (case-insensitive), the same provider/id/name filter. |
 | `,thinking [level]` | Set the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); no level cycles. |
 | `,compact [instructions]` | Compact the Session context. |
 | `,reload` | Reload the Session's plugins. |
@@ -91,11 +91,8 @@ Flags win over environment variables:
 | `--control-channel` | `IRC_CONTROL_CHANNEL` | `#pi` |
 | `--all` | `IRC_RESPOND_TO_ALL` | off |
 | `--state-dir` | `PI_IRC_STATE_DIR` | `<agentDir>/irc` |
-| `--web-port`, `--web-token` | `PI_WEB_PORT`, `PI_WEB_TOKEN`, `PI_WEB_HOST` | web gateway off |
 | | `PI_IRC_CONTROL_URL`, `PI_IRC_CONTROL_TOKEN` | set by `pi irc` for its workers; do not set by hand |
 
-With `--web-port`, the `pi web` gateway runs on the same server, so every
-channel's Session can be watched in the browser.
 
 ## How it is built
 
@@ -105,7 +102,7 @@ channel's Session can be watched in the browser.
 - `bot.ts`: irc-framework client, message routing, control commands, a
   per-target send queue with spacing to stay under flood limits.
 - `SessionManagement.fork` is new on the server: `repo.fork` with tree scope,
-  exposed through the same client wrapper the TUI and web app use.
+  exposed through the same client wrapper the TUI uses.
 
 Tests: `test/experimental-irc.test.ts` (commands, formatting, store, engine
 fork over a fake coordinator, config) and the fork case in

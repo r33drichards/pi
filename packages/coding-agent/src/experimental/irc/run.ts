@@ -1,18 +1,13 @@
 /**
- * `pi irc`: the foreground experimental server, the IRC presentation, and an
- * optional browser gateway on the same server so channels can be watched in
- * `pi web`. Configuration comes from flags, then IRC_* environment variables.
+ * `pi irc`: the foreground experimental server plus the IRC presentation.
+ * Configuration comes from flags, then IRC_* environment variables.
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { IrcCommand } from "../../cli/experimental/commands/irc.ts";
 import { getAgentDir } from "../../config.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
 import type { RunningServer, startForegroundServer } from "../server.ts";
-import { buildWebApp } from "../web/build.ts";
-import { startWebGateway } from "../web/gateway.ts";
 import { type IrcBotOptions, IrcPiBot } from "./bot.ts";
 import { CONTROL_TOKEN_ENV, CONTROL_URL_ENV, type ControlServer, startControlServer } from "./control.ts";
 import { type EngineForkOptions, engineCapabilities } from "./engine-fork.ts";
@@ -105,25 +100,8 @@ export async function runIrcPresentation(
 	});
 	log(`Server: ${server.serverId}`);
 	log(`Socket: ${server.socketPath}`);
-	let buildRoot: string | undefined;
-	let gateway: Awaited<ReturnType<typeof startWebGateway>> | undefined;
 	let bot: IrcPiBot | undefined;
 	try {
-		const webPort = command.webPort ?? (env.PI_WEB_PORT === undefined ? undefined : Number(env.PI_WEB_PORT));
-		if (webPort !== undefined && Number.isInteger(webPort)) {
-			buildRoot = await mkdtemp(join(tmpdir(), "pi-irc-web-"));
-			const app = await buildWebApp(buildRoot);
-			const token = command.webToken ?? env.PI_WEB_TOKEN;
-			gateway = await startWebGateway({
-				socketPath: server.socketPath,
-				serverId: server.serverId,
-				staticDir: app.staticDir,
-				host: env.PI_WEB_HOST ?? "127.0.0.1",
-				port: webPort,
-				...(token === undefined ? {} : { token }),
-			});
-			log(`Web: ${gateway.url}${token ? " (token required: append ?token=<your token>)" : ""}`);
-		}
 		const engineFork = resolveEngineFork(process.cwd());
 		let engineHeap = false;
 		if (engineFork) {
@@ -168,9 +146,7 @@ export async function runIrcPresentation(
 		});
 	} finally {
 		await bot?.close();
-		await gateway?.close();
 		await server.close();
 		await control?.close();
-		if (buildRoot) await rm(buildRoot, { recursive: true, force: true });
 	}
 }

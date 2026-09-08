@@ -5,7 +5,7 @@ describe("experimental CLI command composition", () => {
 	test("requires an experimental subcommand", () => {
 		expect(cli.parse([])).toEqual({
 			ok: false,
-			errors: ["Expected experimental command: server, client, web, or irc"],
+			errors: ["Expected experimental command: server, client, or irc"],
 		});
 	});
 
@@ -26,7 +26,6 @@ describe("experimental CLI command composition", () => {
 			{
 				runServer,
 				runClient: vi.fn(() => undefined),
-				runWeb: vi.fn(() => undefined),
 				runIrc: vi.fn(() => undefined),
 			},
 		);
@@ -42,11 +41,10 @@ describe("experimental CLI command composition", () => {
 		expect(runServer).toHaveBeenCalledWith(command);
 	});
 
-	test.each(["server", "client", "web", "irc"] as const)("executes the parsed %s command", async (name) => {
+	test.each(["server", "client", "irc"] as const)("executes the parsed %s command", async (name) => {
 		const context = {
 			runServer: vi.fn(() => undefined),
 			runClient: vi.fn(() => undefined),
-			runWeb: vi.fn(() => undefined),
 			runIrc: vi.fn(() => undefined),
 		};
 		const result = await cli.execute([name], context);
@@ -54,27 +52,13 @@ describe("experimental CLI command composition", () => {
 		expect(result).toEqual({ ok: true, command: { command: name } });
 		expect(context.runServer).toHaveBeenCalledTimes(name === "server" ? 1 : 0);
 		expect(context.runClient).toHaveBeenCalledTimes(name === "client" ? 1 : 0);
-		expect(context.runWeb).toHaveBeenCalledTimes(name === "web" ? 1 : 0);
 		expect(context.runIrc).toHaveBeenCalledTimes(name === "irc" ? 1 : 0);
 	});
 
 	test("parses irc options", async () => {
-		const context = { runServer: vi.fn(), runClient: vi.fn(), runWeb: vi.fn(), runIrc: vi.fn(() => undefined) };
+		const context = { runServer: vi.fn(), runClient: vi.fn(), runIrc: vi.fn(() => undefined) };
 		const result = await cli.execute(
-			[
-				"irc",
-				"--server",
-				"irc.example",
-				"--port",
-				"6697",
-				"--tls",
-				"--nick",
-				"pi",
-				"--channels",
-				"#pi,#dev",
-				"--web-port",
-				"8600",
-			],
+			["irc", "--server", "irc.example", "--port", "6697", "--tls", "--nick", "pi", "--channels", "#pi,#dev"],
 			context,
 		);
 		expect(result).toEqual({
@@ -86,23 +70,9 @@ describe("experimental CLI command composition", () => {
 				tls: true,
 				nick: "pi",
 				channels: ["#pi", "#dev"],
-				webPort: 8600,
 			},
 		});
-	});
-
-	test("parses web gateway options and refuses a non-loopback host without a token", async () => {
-		const context = { runServer: vi.fn(), runClient: vi.fn(), runWeb: vi.fn(() => undefined), runIrc: vi.fn() };
-		expect(await cli.execute(["web", "--port", "8601", "--token", "abc"], context)).toEqual({
-			ok: true,
-			command: { command: "web", port: 8601, token: "abc" },
-		});
-		expect(context.runWeb).toHaveBeenCalledWith({ command: "web", port: 8601, token: "abc" });
-		expect(cli.parse(["web", "--host", "0.0.0.0"])).toEqual({
-			ok: false,
-			errors: ["--host 0.0.0.0 exposes the gateway beyond loopback; pass --token to require one"],
-		});
-		expect(cli.parse(["web", "--port", "http"])).toEqual({
+		expect(cli.parse(["irc", "--port", "http"])).toEqual({
 			ok: false,
 			errors: ['Invalid --port "http"; expected an integer from 0 to 65535'],
 		});

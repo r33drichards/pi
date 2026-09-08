@@ -85,14 +85,11 @@
 		"@types/node": "22.19.19",
 		"@types/proper-lockfile": "4.1.4",
 		"@types/semver": "7.7.1",
-		"@types/ws": "8.18.1",
 		"irc-framework": "4.14.0",
-		"lit": "3.3.2",
 		"node-petname": "1.0.1",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
-		"vitest": "4.1.9",
-		"ws": "8.21.0"
+		"vitest": "4.1.9"
 	},
 	"keywords": [
 		"coding-agent",
