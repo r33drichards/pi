@@ -259,6 +259,14 @@ export class IrcPiBot {
 				return true;
 			}
 			case "thinking": {
+				const supported = await services.models.getThinkingLevels(BACKGROUND_CONTEXT);
+				if (command.level !== undefined && !supported.includes(command.level)) {
+					this.say(
+						room,
+						`thinking level ${command.level} is not supported by the current model; supported: ${supported.join(", ") || "none"}`,
+					);
+					return true;
+				}
 				if (command.level === undefined) await services.models.cycleThinking(BACKGROUND_CONTEXT);
 				else await services.models.selectThinking(command.level, BACKGROUND_CONTEXT);
 				const level = services.models.state.value?.configuration.thinkingLevel ?? command.level ?? "?";
