@@ -17,7 +17,7 @@
  * bare `,command` is honored in the control channel and DMs.
  */
 
-import { parseSessionCommand, SESSION_COMMANDS, type SessionCommandAction } from "../session-commands.ts";
+import { parseSessionCommand, SESSION_COMMANDS, type SessionCommandAction } from "./session-commands.ts";
 
 export type ControlCommand =
 	| { kind: "join"; channels: string[] }

@@ -1,12 +1,10 @@
 import chalk from "chalk";
 import { cli } from "../cli/experimental/cli.ts";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
-import type { IrcCommand } from "../cli/experimental/commands/irc.ts";
 import type { ServerCommand } from "../cli/experimental/commands/server.ts";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.ts";
 import { runClient } from "./client.ts";
 import { runClientTui } from "./client-tui.ts";
-import { runIrcPresentation } from "./irc/run.ts";
 import type { RadiusRelayHostStatus } from "./radius-relay.ts";
 import { startForegroundServer } from "./server.ts";
 
@@ -93,13 +91,12 @@ async function runClientCommand(command: ClientCommand): Promise<void> {
 
 /** Development-only command dispatch. Published entrypoints must not import this module. */
 export async function runExperimentalCommand(args: string[]): Promise<boolean> {
-	const commands = new Set(["server", "client", "irc"]);
+	const commands = new Set(["server", "client"]);
 	if (!areExperimentalFeaturesEnabled() || args[0] === undefined || !commands.has(args[0])) return false;
 	try {
 		const result = await cli.execute(args, {
 			runServer: runServerCommand,
 			runClient: runClientCommand,
-			runIrc: (command: IrcCommand) => runIrcPresentation(command, startForegroundServer),
 		});
 		if (!result.ok) {
 			for (const error of result.errors) console.error(chalk.red(`Error: ${error}`));

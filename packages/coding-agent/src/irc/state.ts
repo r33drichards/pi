@@ -9,6 +9,8 @@ import { dirname } from "node:path";
 
 export interface ChannelRecord {
 	sessionId: string;
+	/** The session's JSONL file, reopened on restart. */
+	sessionFile?: string;
 	createdAt: number;
 	/** The channel this session was forked from, when it was. */
 	forkedFrom?: string;

@@ -1,21 +1,26 @@
 /**
- * The IRC presentation: one Session per channel (and per DM peer), driven from
+ * The IRC bot: one agent session per channel (and per DM peer), driven from
  * the control channel. Lines addressed to the bot become prompts to that
- * channel's Session; the model's completed messages and tool calls come back
+ * channel's session; the model's completed messages and tool calls come back
  * as channel lines.
+ *
+ * Sessions run in this process on the classic `AgentSession` runtime, so
+ * installed pi extensions work and the delegation tools call straight into
+ * this object instead of going through a control socket.
  */
 
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { ServerError } from "@earendil-works/pi-client";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
-import { filterModels } from "../session-commands.ts";
+import type { ModelRuntime } from "../core/model-runtime.ts";
+import { ChannelSession, type ChannelSessionDeps } from "./channel-session.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
-import type { ControlHandlers, MergeRequest, MergeResult, SendRequest, SpawnRequest, SpawnResult } from "./control.ts";
 import { type EngineForkOptions, forkEngineSession, type MergeStrategy, mergeEngineSessions } from "./engine-fork.ts";
-import { framePrompt } from "./format.ts";
+import { forkNotice, framePrompt } from "./format.ts";
 import { forkChannelName } from "./petname.ts";
-import { SessionLink, type SessionLinkTarget } from "./session-link.ts";
+import { filterModels } from "./session-commands.ts";
 import { ChannelSessionStore } from "./state.ts";
+import type { ChannelDelegate } from "./tools.ts";
 
 export interface IrcBotOptions {
 	server: string;
@@ -29,11 +34,20 @@ export interface IrcBotOptions {
 	/** Only react to channel lines that mention the bot (DMs always count). Default and recommended: true. */
 	addressedOnly: boolean;
 	statePath: string;
-	target: SessionLinkTarget;
-	/** When set, `,fork` also carries the mcp-js filesystem (and heap, if persisted) across, and `,merge` works. */
+	/** Where per-channel working directories live; each channel gets its own. */
+	workspaceRoot: string;
+	cwd: string;
+	agentDir: string;
+	sessionDir: string;
+	/** Extensions and settings, built fresh for each channel's working directory. */
+	createResources: ChannelSessionDeps["createResources"];
+	modelRuntime: ModelRuntime;
+	/** When set, channels get mcp-js sandbox tools and `,fork`/`,merge` carry files. */
 	engineFork?: EngineForkOptions;
 	/** Whether the engine persists heaps, for honest fork replies. */
 	engineHeap?: boolean;
+	/** What the guest can reach, for an honest `run_js` description. */
+	guest?: { network?: boolean; modules?: boolean };
 	/** Default wait for a spawned child's turn. */
 	spawnTimeoutMs?: number;
 	log: (line: string) => void;
@@ -47,20 +61,29 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-/** The server answered that the Session does not exist (as opposed to failing to start it). */
-function isSessionGone(error: unknown): boolean {
-	if (error instanceof ServerError && error.code === "session_not_found") return true;
-	return /unknown session|session was not found/i.test(message(error));
+/**
+ * Whether a prompt explicitly asks for another channel, which is what lets a
+ * forked session post outside its own channel. Naming the channel is the
+ * signal; without it a fork's answer belongs in the fork.
+ */
+export function promptNamesChannel(prompt: string, channel: string): boolean {
+	const bare = channel.replace(/^[#&]/, "");
+	if (bare.length === 0) return false;
+	const escaped = bare.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`[#&]${escaped}(?![\\w-])`, "i").test(prompt);
 }
 
-export class IrcPiBot implements ControlHandlers {
+export class IrcPiBot implements ChannelDelegate {
 	readonly #options: IrcBotOptions;
 	readonly #irc: IrcClient;
 	readonly #store: ChannelSessionStore;
-	readonly #links = new Map<string, SessionLink>();
-	readonly #opening = new Map<string, Promise<SessionLink>>();
+	readonly #sessions = new Map<string, ChannelSession>();
+	readonly #opening = new Map<string, Promise<ChannelSession>>();
 	readonly #sendQueues = new Map<string, Promise<void>>();
-	#control: SessionLink | undefined;
+	/** Channels whose next prompt carries the "you are in X" fork notice. */
+	readonly #pendingNotice = new Map<string, string>();
+	/** The last prompt text a channel received, for the irc_send policy. */
+	readonly #lastPrompt = new Map<string, string>();
 	#nick: string;
 	#closed = false;
 
@@ -77,6 +100,32 @@ export class IrcPiBot implements ControlHandlers {
 
 	get store(): ChannelSessionStore {
 		return this.#store;
+	}
+
+	/**
+	 * A channel's own working directory. Extensions keep project-local state
+	 * under `cwd` — pi-schedule-prompt's job store, for one — so channels
+	 * sharing a directory would race over each other's files.
+	 */
+	#cwdFor(channel: string): string {
+		const safe = channel.replace(/^[#&]/, "").replace(/[^a-z0-9._-]/gi, "_") || "default";
+		const dir = join(this.#options.workspaceRoot, safe);
+		mkdirSync(dir, { recursive: true });
+		return dir;
+	}
+
+	#deps(channel: string): ChannelSessionDeps {
+		return {
+			cwd: this.#cwdFor(channel),
+			agentDir: this.#options.agentDir,
+			sessionDir: this.#options.sessionDir,
+			createResources: this.#options.createResources,
+			modelRuntime: this.#options.modelRuntime,
+			delegate: this,
+			...(this.#options.engineFork === undefined ? {} : { engine: this.#options.engineFork }),
+			...(this.#options.guest === undefined ? {} : { guest: this.#options.guest }),
+			log: this.#options.log,
+		};
 	}
 
 	/** Channels to be in: startup list plus everything remembered from earlier runs. */
@@ -100,7 +149,7 @@ export class IrcPiBot implements ControlHandlers {
 		this.#irc.on("join", (event) => {
 			if (event.nick !== this.#nick) return;
 			log(`IRC: joined ${event.channel}`);
-			void this.#linkFor(event.channel).catch((error) => log(`IRC: ${event.channel}: ${message(error)}`));
+			void this.#sessionFor(event.channel).catch((error) => log(`IRC: ${event.channel}: ${message(error)}`));
 		});
 		this.#irc.on("privmsg", (event) => {
 			void this.#onMessage(event).catch((error) => {
@@ -137,70 +186,67 @@ export class IrcPiBot implements ControlHandlers {
 		const next = previous.then(async () => {
 			for (const line of lines) {
 				if (this.#closed) return;
-				this.#irc.say(target, line);
+				try {
+					this.#irc.say(target, line);
+				} catch (error) {
+					// One failed line must not silence the channel: the queue is
+					// chained, so a rejection here would skip every later send.
+					this.#options.log(`IRC: send to ${target} failed: ${message(error)}`);
+				}
 				await new Promise((resolve) => setTimeout(resolve, spacing));
 			}
 		});
-		this.#sendQueues.set(target, next);
+		this.#sendQueues.set(
+			target,
+			next.catch(() => {}),
+		);
 	}
 
-	/** The management service, over the control channel's link or a temporary one. */
-	async #management(): Promise<SessionLink> {
-		if (this.#control) return this.#control;
-		const first = this.#store.entries()[0];
-		if (first) {
-			this.#control = await this.#linkFor(first[0]);
-			return this.#control;
-		}
-		this.#control = await this.#linkFor(this.#options.controlChannel);
-		return this.#control;
+	/** The relay that puts a channel's session activity into that channel. */
+	#relayTo(channel: string) {
+		return {
+			text: (lines: string[]) => this.say(channel, lines),
+			tool: (line: string) => this.say(channel, line),
+		};
 	}
 
-	/** Open (or reuse) the link for a channel or DM peer, creating its Session on first use. */
-	async #linkFor(name: string): Promise<SessionLink> {
+	/** Open (or reuse) a channel's session, creating it on first use. */
+	async #sessionFor(name: string): Promise<ChannelSession> {
 		const key = name.toLowerCase();
-		const existing = this.#links.get(key);
+		const existing = this.#sessions.get(key);
 		if (existing) return existing;
 		const pending = this.#opening.get(key);
 		if (pending) return pending;
 		const open = (async () => {
 			const record = this.#store.get(key);
-			if (record) {
+			if (record?.sessionFile) {
 				try {
-					return await SessionLink.open(this.#options.target, record.sessionId);
+					return await ChannelSession.open(key, this.#deps(key), { sessionFile: record.sessionFile });
 				} catch (error) {
-					// Only a Session the server no longer knows gets replaced; a worker
-					// or engine that is merely unavailable right now keeps its mapping.
-					if (!isSessionGone(error)) throw error;
 					this.#options.log(
-						`IRC: ${key}: session ${record.sessionId} is gone (${message(error)}); creating a new one`,
+						`IRC: ${key}: could not reopen session ${record.sessionId} (${message(error)}); starting a new one`,
 					);
 					this.#store.delete(key);
 				}
 			}
-			const created = await this.#createSession();
-			this.#store.set(key, { sessionId: created, createdAt: Date.now() });
-			return await SessionLink.open(this.#options.target, created);
+			const created = await ChannelSession.open(key, this.#deps(key));
+			this.#store.set(key, {
+				sessionId: created.sessionId,
+				sessionFile: created.sessionFile,
+				createdAt: Date.now(),
+			});
+			return created;
 		})();
 		this.#opening.set(key, open);
 		try {
-			const link = await open;
-			this.#links.set(key, link);
-			return link;
+			const session = await open;
+			this.#sessions.set(key, session);
+			// A session relays its own activity even when nobody is prompting, so an
+			// extension (a scheduled prompt, say) still reaches the channel.
+			session.watch(this.#relayTo(key));
+			return session;
 		} finally {
 			this.#opening.delete(key);
-		}
-	}
-
-	/** Create a Session through any connected link, or a throwaway connection when none exists yet. */
-	async #createSession(): Promise<string> {
-		const any = this.#links.values().next().value as SessionLink | undefined;
-		if (any) return (await any.services.management.create({}, BACKGROUND_CONTEXT)).sessionId;
-		const probe = await SessionLink.openDetached(this.#options.target);
-		try {
-			return (await probe.services.management.create({}, BACKGROUND_CONTEXT)).sessionId;
-		} finally {
-			await probe.close();
 		}
 	}
 
@@ -216,7 +262,6 @@ export class IrcPiBot implements ControlHandlers {
 		// `pi ,model astra` is a command in a mention; a bare `,command` counts in the control channel and DMs.
 		const command = body !== undefined ? parseCommand(body) : undefined;
 		if (command) {
-			// A command inside a mention is honored in any channel the bot is in.
 			await this.#onCommand(command, room, true);
 			return;
 		}
@@ -228,16 +273,22 @@ export class IrcPiBot implements ControlHandlers {
 			}
 		}
 		if (body === undefined || body.length === 0) return;
-		const link = await this.#linkFor(room);
-		const prompt = framePrompt(isDm ? `dm:${event.nick}` : room, event.nick, body);
-		if (link.busy) this.say(room, `(steering the running turn)`);
-		await link.prompt(prompt, {
-			text: (lines) => this.say(room, lines),
-			tool: (line) => this.say(room, line),
-		});
+		const session = await this.#sessionFor(room);
+		const prompt = this.#framePromptFor(room, isDm ? `dm:${event.nick}` : room, event.nick, body);
+		if (session.busy) this.say(room, `(steering the running turn)`);
+		await session.prompt(prompt);
 	}
 
-	/** Session commands act on the room's own Session. */
+	/** The prompt text a session sees, with a one-time fork notice when it has just been forked. */
+	#framePromptFor(room: string, label: string, nick: string, body: string): string {
+		this.#lastPrompt.set(room, body);
+		const notice = this.#pendingNotice.get(room);
+		if (notice !== undefined) this.#pendingNotice.delete(room);
+		const framed = framePrompt(label, nick, body);
+		return notice === undefined ? framed : `${notice}\n${framed}`;
+	}
+
+	/** Session commands act on the room's own session. */
 	async #onSessionCommand(command: IrcCommand, room: string): Promise<boolean> {
 		if (
 			command.kind !== "model" &&
@@ -247,17 +298,21 @@ export class IrcPiBot implements ControlHandlers {
 		) {
 			return false;
 		}
-		const link = await this.#linkFor(room);
-		const services = link.services;
+		const session = await this.#sessionFor(room);
 		switch (command.kind) {
 			case "model": {
-				const state = services.models.state.value;
-				const current = state?.configuration.model;
-				const matches = filterModels(state?.catalog.availableModels ?? [], command.query);
+				const available = await this.#options.modelRuntime.getAvailable();
+				const choices = available.map((model) => ({
+					provider: model.provider,
+					modelId: model.id,
+					name: model.name,
+					model,
+				}));
+				const matches = filterModels(choices, command.query);
 				if (command.query.length === 0) {
-					const names = matches.slice(0, 15).map((model) => `${model.provider}/${model.modelId}`);
+					const names = matches.slice(0, 15).map((choice) => `${choice.provider}/${choice.modelId}`);
 					this.say(room, [
-						`model: ${current ? `${current.provider}/${current.modelId}` : "none"} · thinking: ${state?.configuration.thinkingLevel ?? "?"}`,
+						`model: ${session.modelLabel()} · thinking: ${session.thinkingLevel()}`,
 						`available (${matches.length}): ${names.join(", ")}${matches.length > 15 ? ", …" : ""}`,
 					]);
 					return true;
@@ -267,7 +322,7 @@ export class IrcPiBot implements ControlHandlers {
 					this.say(room, `no model matches "${command.query}"`);
 					return true;
 				}
-				await services.models.select({ provider: chosen.provider, modelId: chosen.modelId }, BACKGROUND_CONTEXT);
+				await session.setModel(chosen.model);
 				this.say(
 					room,
 					`model → ${chosen.provider}/${chosen.modelId}${matches.length > 1 ? ` (${matches.length - 1} other match${matches.length > 2 ? "es" : ""})` : ""}`,
@@ -275,7 +330,7 @@ export class IrcPiBot implements ControlHandlers {
 				return true;
 			}
 			case "thinking": {
-				const supported = await services.models.getThinkingLevels(BACKGROUND_CONTEXT);
+				const supported = session.availableThinkingLevels();
 				if (command.level !== undefined && !supported.includes(command.level)) {
 					this.say(
 						room,
@@ -283,25 +338,21 @@ export class IrcPiBot implements ControlHandlers {
 					);
 					return true;
 				}
-				if (command.level === undefined) await services.models.cycleThinking(BACKGROUND_CONTEXT);
-				else await services.models.selectThinking(command.level, BACKGROUND_CONTEXT);
-				const level = services.models.state.value?.configuration.thinkingLevel ?? command.level ?? "?";
-				this.say(room, `thinking → ${level}`);
+				if (command.level === undefined) session.cycleThinkingLevel();
+				else session.setThinkingLevel(command.level);
+				this.say(room, `thinking → ${session.thinkingLevel()}`);
 				return true;
 			}
-			case "compact": {
-				const response = await services.agent.compact(
-					{ customInstructions: command.instructions },
-					BACKGROUND_CONTEXT,
-				);
-				this.say(room, response.accepted ? "compacted" : `compact rejected: ${response.error.message}`);
+			case "compact":
+				await session.compact(command.instructions);
+				this.say(room, "compacted");
 				return true;
-			}
 			case "reload":
-				await services.plugins.reload(BACKGROUND_CONTEXT);
-				this.say(room, "plugins reloaded");
+				await session.reload();
+				this.say(room, "extensions reloaded");
 				return true;
 		}
+		return false;
 	}
 
 	async #onCommand(command: IrcCommand, room: string, control: boolean): Promise<void> {
@@ -321,7 +372,7 @@ export class IrcPiBot implements ControlHandlers {
 					entries.map(
 						([channel, record]) =>
 							`${channel} → ${record.sessionId}${record.forkedFrom ? ` (forked from ${record.forkedFrom})` : ""}${
-								this.#links.has(channel) ? "" : " (not connected)"
+								this.#sessions.has(channel) ? "" : " (not connected)"
 							}`,
 					),
 				);
@@ -351,9 +402,9 @@ export class IrcPiBot implements ControlHandlers {
 			return;
 		}
 		if (command.kind === "part") {
-			const link = this.#links.get(command.channel);
-			this.#links.delete(command.channel);
-			await link?.close();
+			const session = this.#sessions.get(command.channel);
+			this.#sessions.delete(command.channel);
+			await session?.close();
 			this.#irc.part(command.channel, "session kept; ,join to resume");
 			this.say(room, `left ${command.channel}; its session is kept`);
 			return;
@@ -385,8 +436,8 @@ export class IrcPiBot implements ControlHandlers {
 	}
 
 	/**
-	 * Fork `room`'s Session into `channel` (conversation, and engine files
-	 * when a coordinator is configured), remember the fork base, and join.
+	 * Fork `room`'s session into `channel` (conversation, and engine files when
+	 * a coordinator is configured), remember the fork base, and join.
 	 */
 	async #forkInto(room: string, channel: string): Promise<{ sessionId: string; note: string }> {
 		if (channel === room) throw new Error(`${channel} is this channel; pick another target`);
@@ -396,13 +447,13 @@ export class IrcPiBot implements ControlHandlers {
 				`${channel} already has a session (${existing.sessionId}); ,part it and remove it from the state file to refork`,
 			);
 		}
-		const sourceLink = await this.#linkFor(room);
-		const created = await sourceLink.services.management.fork(sourceLink.sessionId, {}, BACKGROUND_CONTEXT);
+		const source = await this.#sessionFor(room);
+		const created = await ChannelSession.open(channel, this.#deps(channel), { forkFrom: source.sessionFile });
 		let note = "conversation carried over";
 		let forkBaseFs: string | undefined;
 		if (this.#options.engineFork) {
 			try {
-				const carried = await forkEngineSession(sourceLink.sessionId, created.sessionId, this.#options.engineFork);
+				const carried = await forkEngineSession(source.sessionId, created.sessionId, this.#options.engineFork);
 				forkBaseFs = carried.fs;
 				note = carried.seeded
 					? `files${this.#options.engineHeap && carried.heap ? ", heap," : ""} and conversation carried over`
@@ -413,37 +464,34 @@ export class IrcPiBot implements ControlHandlers {
 		}
 		this.#store.set(channel, {
 			sessionId: created.sessionId,
-			createdAt: created.createdAt,
+			sessionFile: created.sessionFile,
+			createdAt: Date.now(),
 			forkedFrom: room,
 			...(forkBaseFs === undefined ? {} : { forkBaseFs }),
 		});
+		this.#sessions.set(channel, created);
+		created.watch(this.#relayTo(channel));
+		// The fork inherits the parent's conversation, so it has to be told where
+		// it now lives; otherwise it answers as if it were still in the parent.
+		this.#pendingNotice.set(channel, forkNotice(channel, room));
 		this.#irc.join(channel);
 		return { sessionId: created.sessionId, note };
 	}
 
-	/** The channel a Session id belongs to, for control calls that identify themselves by session. */
-	#roomForSession(sessionId: string): string {
-		const room = this.#store.channelFor(sessionId);
-		if (room === undefined) throw new Error(`session ${sessionId} is not bound to a channel`);
-		return room;
-	}
-
-	/** Merge `child`'s files into `room`'s Session; the reply text is ready for the channel. */
-	async mergeInto(room: string, child: string, strategy?: MergeStrategy): Promise<MergeResult> {
+	/** Merge `child`'s files into `room`'s session; the reply text is ready for the channel. */
+	async mergeInto(
+		room: string,
+		child: string,
+		strategy?: MergeStrategy,
+	): Promise<{ status: string; message: string }> {
 		const engine = this.#options.engineFork;
-		if (!engine)
-			return {
-				status: "nothing",
-				reason: "no engine",
-				message: "no mcp-js coordinator is configured; nothing to merge",
-			};
+		if (!engine) return { status: "nothing", message: "no mcp-js coordinator is configured; nothing to merge" };
 		const childRecord = this.#store.get(child);
-		if (!childRecord)
-			return { status: "nothing", reason: "unknown child", message: `${child} has no session to merge from` };
-		const parentLink = await this.#linkFor(room);
+		if (!childRecord) return { status: "nothing", message: `${child} has no session to merge from` };
+		const parent = await this.#sessionFor(room);
 		const result = await mergeEngineSessions(
 			{
-				parent: parentLink.sessionId,
+				parent: parent.sessionId,
 				child: childRecord.sessionId,
 				...(childRecord.forkBaseFs ? { base: childRecord.forkBaseFs } : {}),
 				...(strategy ? { prefer: strategy } : {}),
@@ -453,7 +501,6 @@ export class IrcPiBot implements ControlHandlers {
 		if (result.status === "merged") {
 			return {
 				status: "merged",
-				fs: result.fs,
 				message: `merged ${child} into ${room}: files are live (snapshot ${result.fs.slice(0, 12)})`,
 			};
 		}
@@ -461,17 +508,22 @@ export class IrcPiBot implements ControlHandlers {
 			const paths = result.conflicts.map((conflict) => conflict.path).join(", ");
 			return {
 				status: "conflict",
-				conflicts: result.conflicts,
 				message: `merge ${child} into ${room} has conflicts in: ${paths}. Re-run with ours or theirs to resolve (,merge ${child} theirs).`,
 			};
 		}
-		return { status: "nothing", reason: result.reason, message: `nothing to merge from ${child}: ${result.reason}` };
+		return { status: "nothing", message: `nothing to merge from ${child}: ${result.reason}` };
 	}
 
-	// ── control surface for worker-side tools ────────────────────────────────
+	// ── delegation tools, called from a channel's own session ────────────────
 
-	async spawn(request: SpawnRequest): Promise<SpawnResult> {
-		const room = this.#roomForSession(request.session);
+	async spawn(request: { room: string; prompt: string; name?: string; timeoutSeconds?: number }): Promise<{
+		channel: string;
+		sessionId: string;
+		status: "completed" | "timeout" | "failed";
+		text: string;
+		error?: string;
+	}> {
+		const room = request.room;
 		const channel = request.name
 			? isChannel(request.name)
 				? request.name.toLowerCase()
@@ -479,15 +531,16 @@ export class IrcPiBot implements ControlHandlers {
 			: this.#freshChannelName(room);
 		const forked = await this.#forkInto(room, channel);
 		this.say(room, `spawned ${channel} (session ${forked.sessionId}; ${forked.note})`);
-		const link = await this.#linkFor(channel);
+		const session = await this.#sessionFor(channel);
 		const timeoutMs = (request.timeoutSeconds ?? 0) * 1000 || this.#options.spawnTimeoutMs || 600_000;
+		// The child channel already relays its own output; this only captures the
+		// text so a timed-out spawn can still return what the child managed to say.
 		let partial = "";
-		const relay = {
+		const capture = {
 			text: (lines: string[]) => {
 				partial = lines.join("\n");
-				this.say(channel, lines);
 			},
-			tool: (line: string) => this.say(channel, line),
+			tool: () => {},
 		};
 		this.say(channel, `[from ${room}] ${request.prompt}`.split("\n"));
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -495,12 +548,10 @@ export class IrcPiBot implements ControlHandlers {
 			timer = setTimeout(() => resolve("timeout"), timeoutMs);
 		});
 		try {
-			const outcome = await Promise.race([
-				link.prompt(framePrompt(channel, room, request.prompt), relay).then((result) => result.text),
-				timeout,
-			]);
+			const prompt = this.#framePromptFor(channel, channel, room, request.prompt);
+			const outcome = await Promise.race([session.prompt(prompt, capture).then((result) => result.text), timeout]);
 			if (outcome === "timeout") {
-				await link.abort().catch(() => {});
+				await session.abort().catch(() => {});
 				return { channel, sessionId: forked.sessionId, status: "timeout", text: partial };
 			}
 			return { channel, sessionId: forked.sessionId, status: "completed", text: outcome || partial };
@@ -511,40 +562,45 @@ export class IrcPiBot implements ControlHandlers {
 		}
 	}
 
-	async send(request: SendRequest): Promise<void> {
-		const room = this.#roomForSession(request.session);
+	async send(request: { room: string; channel: string; text: string }): Promise<void> {
+		const room = request.room;
 		const channel = isChannel(request.channel) ? request.channel.toLowerCase() : request.channel;
-		if (isChannel(channel) && !this.#store.get(channel) && !this.#links.has(channel)) {
+		// A fork answers in its own channel. Posting back to the channel it was
+		// forked from needs the user to have asked for it by name.
+		const parent = this.#store.get(room)?.forkedFrom;
+		if (parent !== undefined && channel === parent.toLowerCase()) {
+			const asked = promptNamesChannel(this.#lastPrompt.get(room) ?? "", channel);
+			if (!asked) {
+				throw new Error(
+					`${room} was forked from ${channel}; your reply already goes to ${room}. Only post to ${channel} when the user asks for it by name.`,
+				);
+			}
+		}
+		if (isChannel(channel) && !this.#store.get(channel) && !this.#sessions.has(channel)) {
 			throw new Error(`not in ${channel}; ,join it first`);
 		}
 		this.say(channel, request.text.split("\n"));
 		// The bot never hears its own lines, so a mention in the text prompts the
-		// target channel's Session here, attributed to the sending channel.
+		// target channel's session here, attributed to the sending channel.
 		const mentioned = mentionText(request.text, this.#nick);
 		if (mentioned !== undefined && channel !== room && isChannel(channel)) {
-			void this.#linkFor(channel)
-				.then((link) =>
-					link.prompt(framePrompt(channel, room, mentioned), {
-						text: (lines) => this.say(channel, lines),
-						tool: (line) => this.say(channel, line),
-					}),
-				)
+			void this.#sessionFor(channel)
+				.then((session) => session.prompt(this.#framePromptFor(channel, channel, room, mentioned)))
 				.catch((error) => this.say(channel, `error: ${message(error)}`));
 		}
 	}
 
-	async merge(request: MergeRequest): Promise<MergeResult> {
-		const room = this.#roomForSession(request.session);
+	async merge(request: { room: string; channel: string; strategy?: MergeStrategy }): Promise<{ message: string }> {
 		const child = isChannel(request.channel) ? request.channel.toLowerCase() : `#${request.channel.toLowerCase()}`;
-		const result = await this.mergeInto(room, child, request.strategy);
-		this.say(room, result.message);
+		const result = await this.mergeInto(request.room, child, request.strategy);
+		this.say(request.room, result.message);
 		return result;
 	}
 
 	async close(): Promise<void> {
 		this.#closed = true;
 		this.#irc.quit("pi shutting down");
-		await Promise.allSettled([...this.#links.values()].map((link) => link.close()));
-		this.#links.clear();
+		await Promise.allSettled([...this.#sessions.values()].map((session) => session.close()));
+		this.#sessions.clear();
 	}
 }

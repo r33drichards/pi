@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { parseCommand } from "../src/experimental/irc/commands.ts";
-import { type ControlHandlers, startControlServer } from "../src/experimental/irc/control.ts";
-import { type EngineForkOptions, forkEngineSession, mergeEngineSessions } from "../src/experimental/irc/engine-fork.ts";
-import { createIrcTools, ircToolsFromEnv } from "../src/experimental/irc/tools.ts";
+import { promptNamesChannel } from "../src/irc/bot.ts";
+import { parseCommand } from "../src/irc/commands.ts";
+import { type EngineForkOptions, forkEngineSession, mergeEngineSessions } from "../src/irc/engine-fork.ts";
+import { type ChannelDelegate, createDelegationTools, createSandboxTools } from "../src/irc/tools.ts";
 
 /** A fake coordinator: sessions with snapshot logs, exec folds, and a scripted merge. */
 function fakeEngine(merge: (body: Record<string, unknown>) => unknown) {
@@ -105,10 +105,11 @@ describe(",merge command", () => {
 	});
 });
 
-describe("control surface and worker tools", () => {
-	it("authenticates, routes, and the tools round-trip through it", async () => {
+describe("delegation tools", () => {
+	/** A delegate that records what the tools asked the bot to do. */
+	function fakeDelegate() {
 		const calls: unknown[] = [];
-		const handlers: ControlHandlers = {
+		const delegate: ChannelDelegate = {
 			async spawn(request) {
 				calls.push(["spawn", request]);
 				return { channel: "#pi-brave-otter", sessionId: "child-1", status: "completed", text: "plan written" };
@@ -118,44 +119,60 @@ describe("control surface and worker tools", () => {
 			},
 			async merge(request) {
 				calls.push(["merge", request]);
-				return { status: "merged", fs: "abc", message: "merged #pi-brave-otter into #pi" };
+				return { message: "merged #pi-brave-otter into #pi" };
 			},
 		};
-		const control = await startControlServer(handlers);
-		try {
-			// Wrong token is rejected before any handler runs.
-			const denied = await fetch(`${control.url}/send`, { method: "POST", body: "{}" });
-			expect(denied.status).toBe(401);
-			const env = { PI_IRC_CONTROL_URL: control.url, PI_IRC_CONTROL_TOKEN: control.token };
-			expect(ircToolsFromEnv("s1", {})).toBeUndefined();
-			const tools = createIrcTools<{ env: unknown }>(ircToolsFromEnv("parent-session", env)!);
-			expect(tools.map((tool) => tool.name)).toEqual(["spawn_channel", "irc_send", "merge_channel"]);
-			const run = (name: string, params: unknown) =>
-				tools
-					.find((tool) => tool.name === name)!
-					.execute("id", params as never, () => {}, { env: undefined }, {} as never, {} as never);
+		return { calls, delegate };
+	}
 
-			const spawned = await run("spawn_channel", { prompt: "write a plan" });
-			expect(spawned.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("plan written") });
-			expect(calls[0]).toEqual(["spawn", { session: "parent-session", prompt: "write a plan" }]);
+	const run = (tools: ReturnType<typeof createDelegationTools>, name: string, params: unknown) =>
+		tools.find((tool) => tool.name === name)!.execute("id", params as never, undefined, undefined, {} as never);
 
-			await run("irc_send", { channel: "#pi", text: "pi: hello" });
-			expect(calls[1]).toEqual(["send", { session: "parent-session", channel: "#pi", text: "pi: hello" }]);
+	it("binds each tool to its own channel and round-trips through the bot", async () => {
+		const { calls, delegate } = fakeDelegate();
+		const tools = createDelegationTools(delegate, "#pi");
+		expect(tools.map((tool) => tool.name)).toEqual(["spawn_channel", "irc_send", "merge_channel"]);
 
-			const merged = await run("merge_channel", { channel: "#pi-brave-otter", strategy: "theirs" });
-			expect(merged.content[0]).toMatchObject({ text: "merged #pi-brave-otter into #pi" });
-			expect(calls[2]).toEqual([
-				"merge",
-				{ session: "parent-session", channel: "#pi-brave-otter", strategy: "theirs" },
-			]);
+		const spawned = await run(tools, "spawn_channel", { prompt: "write a plan" });
+		expect(spawned.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("plan written") });
+		expect(calls[0]).toEqual(["spawn", { room: "#pi", prompt: "write a plan" }]);
 
-			// Handler failures surface as tool errors with the message.
-			handlers.send = async () => {
-				throw new Error("not in #nowhere; ,join it first");
-			};
-			await expect(run("irc_send", { channel: "#nowhere", text: "x" })).rejects.toThrow("not in #nowhere");
-		} finally {
-			await control.close();
-		}
+		await run(tools, "irc_send", { channel: "#dev", text: "pi: hello" });
+		expect(calls[1]).toEqual(["send", { room: "#pi", channel: "#dev", text: "pi: hello" }]);
+
+		const merged = await run(tools, "merge_channel", { channel: "#pi-brave-otter", strategy: "theirs" });
+		expect(merged.content[0]).toMatchObject({ text: "merged #pi-brave-otter into #pi" });
+		expect(calls[2]).toEqual(["merge", { room: "#pi", channel: "#pi-brave-otter", strategy: "theirs" }]);
+	});
+
+	it("surfaces a refusal from the bot as a tool error", async () => {
+		const { delegate } = fakeDelegate();
+		delegate.send = async () => {
+			throw new Error("#child was forked from #pi; your reply already goes to #child.");
+		};
+		const tools = createDelegationTools(delegate, "#child");
+		await expect(run(tools, "irc_send", { channel: "#pi", text: "here is the answer" })).rejects.toThrow(
+			"already goes to #child",
+		);
+	});
+
+	it("tells the model the sandbox tools replace the host ones", () => {
+		const env = {
+			runtimeDescription: "Runtime: the mcp-js V8 sandbox.",
+		} as never;
+		const tools = createSandboxTools(env);
+		expect(tools.map((tool) => tool.name)).toEqual(["read", "write", "run_js"]);
+		expect(tools.find((tool) => tool.name === "run_js")!.description).toContain("mcp-js V8 sandbox");
+	});
+});
+
+describe("fork reply policy", () => {
+	it("only counts a prompt that names the channel", () => {
+		expect(promptNamesChannel("tell #pi we are done", "#pi")).toBe(true);
+		expect(promptNamesChannel("post the summary to #pi please", "#pi")).toBe(true);
+		expect(promptNamesChannel("what is in /repo?", "#pi")).toBe(false);
+		// A different channel with the same prefix must not match.
+		expect(promptNamesChannel("tell #pilot about it", "#pi")).toBe(false);
+		expect(promptNamesChannel("pi: summarize", "#pi")).toBe(false);
 	});
 });

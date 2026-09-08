@@ -5,7 +5,7 @@ describe("experimental CLI command composition", () => {
 	test("requires an experimental subcommand", () => {
 		expect(cli.parse([])).toEqual({
 			ok: false,
-			errors: ["Expected experimental command: server, client, or irc"],
+			errors: ["Expected experimental command: server or client"],
 		});
 	});
 
@@ -26,7 +26,6 @@ describe("experimental CLI command composition", () => {
 			{
 				runServer,
 				runClient: vi.fn(() => undefined),
-				runIrc: vi.fn(() => undefined),
 			},
 		);
 
@@ -41,40 +40,15 @@ describe("experimental CLI command composition", () => {
 		expect(runServer).toHaveBeenCalledWith(command);
 	});
 
-	test.each(["server", "client", "irc"] as const)("executes the parsed %s command", async (name) => {
+	test.each(["server", "client"] as const)("executes the parsed %s command", async (name) => {
 		const context = {
 			runServer: vi.fn(() => undefined),
 			runClient: vi.fn(() => undefined),
-			runIrc: vi.fn(() => undefined),
 		};
 		const result = await cli.execute([name], context);
 
 		expect(result).toEqual({ ok: true, command: { command: name } });
 		expect(context.runServer).toHaveBeenCalledTimes(name === "server" ? 1 : 0);
 		expect(context.runClient).toHaveBeenCalledTimes(name === "client" ? 1 : 0);
-		expect(context.runIrc).toHaveBeenCalledTimes(name === "irc" ? 1 : 0);
-	});
-
-	test("parses irc options", async () => {
-		const context = { runServer: vi.fn(), runClient: vi.fn(), runIrc: vi.fn(() => undefined) };
-		const result = await cli.execute(
-			["irc", "--server", "irc.example", "--port", "6697", "--tls", "--nick", "pi", "--channels", "#pi,#dev"],
-			context,
-		);
-		expect(result).toEqual({
-			ok: true,
-			command: {
-				command: "irc",
-				server: "irc.example",
-				port: 6697,
-				tls: true,
-				nick: "pi",
-				channels: ["#pi", "#dev"],
-			},
-		});
-		expect(cli.parse(["irc", "--port", "http"])).toEqual({
-			ok: false,
-			errors: ['Invalid --port "http"; expected an integer from 0 to 65535'],
-		});
 	});
 });
