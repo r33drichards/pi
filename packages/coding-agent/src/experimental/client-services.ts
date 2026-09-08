@@ -1,7 +1,6 @@
 /**
  * Service activation shared by every experimental presentation: the terminal
- * client and the browser app. Browser-safe: no Node imports, no transport
- * knowledge; it takes an already connected `Client` and its service sources.
+ * client and the IRC bot. No Node imports, no transport knowledge; it takes an already connected `Client` and its service sources.
  */
 
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";

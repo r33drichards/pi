@@ -1,8 +1,7 @@
 /**
- * Session commands shared by every presentation: the browser composer
- * (`/model …`) and the IRC bot (`pi ,model …`). Each maps to a service call
- * on the attached Session; presentations own the prefix and the transport.
- * Browser-safe: no Node imports.
+ * Session commands for presentations such as the IRC bot (`pi ,model …`).
+ * Each maps to a service call on the attached Session; presentations own the
+ * prefix and the transport.
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -61,7 +60,7 @@ export interface ModelChoice {
 	name: string;
 }
 
-/** The models matching a `model` query, the same filter the browser picker applies. */
+/** The models matching a `model` query: substring of `provider/id name`, case-insensitive. */
 export function filterModels<T extends ModelChoice>(models: readonly T[], query: string): T[] {
 	const needle = query.trim().toLowerCase();
 	if (needle.length === 0) return [...models];
