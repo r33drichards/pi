@@ -7,7 +7,8 @@
 
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
-import { addressedText, HELP_LINES, type IrcCommand, isChannel, parseCommand } from "./commands.ts";
+import { filterModels } from "../session-commands.ts";
+import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
 import { type EngineForkOptions, forkEngineSession } from "./engine-fork.ts";
 import { framePrompt } from "./format.ts";
 import { SessionLink, type SessionLinkTarget } from "./session-link.ts";
@@ -22,7 +23,7 @@ export interface IrcBotOptions {
 	/** Channels joined at startup; the control channel is always included. */
 	channels: string[];
 	controlChannel: string;
-	/** Only react to channel lines addressed to the bot (DMs always count). */
+	/** Only react to channel lines that mention the bot (DMs always count). Default and recommended: true. */
 	addressedOnly: boolean;
 	statePath: string;
 	target: SessionLinkTarget;
@@ -191,17 +192,27 @@ export class IrcPiBot {
 		if (event.from_server || event.nick === this.#nick) return;
 		const isDm = event.target.toLowerCase() === this.#nick.toLowerCase();
 		const room = isDm ? event.nick : event.target.toLowerCase();
-		const command = parseCommand(event.message);
+		const control = room === this.#options.controlChannel.toLowerCase() || isDm;
+		// Channel lines are prompts only when they mention the bot. DMs are
+		// addressed by nature. Responding to everything is an explicit opt-in.
+		const mentioned = mentionText(event.message, this.#nick);
+		const body = isDm || !this.#options.addressedOnly ? (mentioned ?? event.message.trim()) : mentioned;
+		// `pi ,model astra` is a command in a mention; a bare `,command` counts in the control channel and DMs.
+		const command = body !== undefined ? parseCommand(body) : undefined;
 		if (command) {
 			await this.#onCommand(command, room, isDm);
 			return;
 		}
-		let text: string | undefined;
-		if (isDm || !this.#options.addressedOnly) text = addressedText(event.message, this.#nick) ?? event.message.trim();
-		else text = addressedText(event.message, this.#nick);
-		if (text === undefined || text.length === 0) return;
+		if (mentioned === undefined && control) {
+			const bare = parseCommand(event.message);
+			if (bare) {
+				await this.#onCommand(bare, room, isDm);
+				return;
+			}
+		}
+		if (body === undefined || body.length === 0) return;
 		const link = await this.#linkFor(room);
-		const prompt = framePrompt(isDm ? `dm:${event.nick}` : room, event.nick, text);
+		const prompt = framePrompt(isDm ? `dm:${event.nick}` : room, event.nick, body);
 		if (link.busy) this.say(room, `(steering the running turn)`);
 		await link.prompt(prompt, {
 			text: (lines) => this.say(room, lines),
@@ -209,8 +220,68 @@ export class IrcPiBot {
 		});
 	}
 
+	/** Session commands act on the room's own Session. */
+	async #onSessionCommand(command: IrcCommand, room: string): Promise<boolean> {
+		if (
+			command.kind !== "model" &&
+			command.kind !== "thinking" &&
+			command.kind !== "compact" &&
+			command.kind !== "reload"
+		) {
+			return false;
+		}
+		const link = await this.#linkFor(room);
+		const services = link.services;
+		switch (command.kind) {
+			case "model": {
+				const state = services.models.state.value;
+				const current = state?.configuration.model;
+				const matches = filterModels(state?.catalog.availableModels ?? [], command.query);
+				if (command.query.length === 0) {
+					const names = matches.slice(0, 15).map((model) => `${model.provider}/${model.modelId}`);
+					this.say(room, [
+						`model: ${current ? `${current.provider}/${current.modelId}` : "none"} · thinking: ${state?.configuration.thinkingLevel ?? "?"}`,
+						`available (${matches.length}): ${names.join(", ")}${matches.length > 15 ? ", …" : ""}`,
+					]);
+					return true;
+				}
+				const chosen = matches[0];
+				if (!chosen) {
+					this.say(room, `no model matches "${command.query}"`);
+					return true;
+				}
+				await services.models.select({ provider: chosen.provider, modelId: chosen.modelId }, BACKGROUND_CONTEXT);
+				this.say(
+					room,
+					`model → ${chosen.provider}/${chosen.modelId}${matches.length > 1 ? ` (${matches.length - 1} other match${matches.length > 2 ? "es" : ""})` : ""}`,
+				);
+				return true;
+			}
+			case "thinking": {
+				if (command.level === undefined) await services.models.cycleThinking(BACKGROUND_CONTEXT);
+				else await services.models.selectThinking(command.level, BACKGROUND_CONTEXT);
+				const level = services.models.state.value?.configuration.thinkingLevel ?? command.level ?? "?";
+				this.say(room, `thinking → ${level}`);
+				return true;
+			}
+			case "compact": {
+				const response = await services.agent.compact(
+					{ customInstructions: command.instructions },
+					BACKGROUND_CONTEXT,
+				);
+				this.say(room, response.accepted ? "compacted" : `compact rejected: ${response.error.message}`);
+				return true;
+			}
+			case "reload":
+				await services.plugins.reload(BACKGROUND_CONTEXT);
+				this.say(room, "plugins reloaded");
+				return true;
+		}
+	}
+
 	async #onCommand(command: IrcCommand, room: string, isDm: boolean): Promise<void> {
 		const control = room === this.#options.controlChannel.toLowerCase() || isDm;
+		if (await this.#onSessionCommand(command, room)) return;
 		switch (command.kind) {
 			case "help":
 				this.say(room, HELP_LINES);

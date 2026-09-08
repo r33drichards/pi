@@ -1,30 +1,45 @@
 /**
- * Control commands typed in IRC. Comma-prefixed, like the irc-agent bot's
- * command prefixes, so they never collide with ordinary chat.
+ * Commands typed in IRC. Comma-prefixed, like the irc-agent bot's command
+ * prefixes, so they never collide with ordinary chat. The set is the union of
+ * the session commands every presentation has (`,model`, `,thinking`,
+ * `,compact`, `,reload`, see `session-commands.ts`) and the channel control
+ * commands only this presentation has:
  *
  *   ,join #a,#b     join channels; each gets its own session
  *   ,fork #chan     join #chan with a session forked from the current channel's
  *   ,part #chan     leave a channel; its session stays for a later ,join
  *   ,sessions       list channel -> session
  *   ,help
+ *
+ * A mention whose body starts with `,` is a command (`pi ,model astra`); a
+ * bare `,command` is honored in the control channel and DMs.
  */
 
-export type IrcCommand =
+import { parseSessionCommand, SESSION_COMMANDS, type SessionCommandAction } from "../session-commands.ts";
+
+export type ControlCommand =
 	| { kind: "join"; channels: string[] }
 	| { kind: "fork"; channel: string; from?: string }
 	| { kind: "part"; channel: string }
 	| { kind: "sessions" }
-	| { kind: "help" }
-	| { kind: "error"; message: string };
+	| { kind: "help" };
+
+export type IrcCommand = ControlCommand | SessionCommandAction;
 
 export const COMMAND_PREFIX = ",";
 
+const CONTROL_COMMANDS = [
+	{ usage: "join #a,#b", description: "join channels, one session each" },
+	{ usage: "fork #chan [#from]", description: "join #chan with a session forked from #from (default: this channel)" },
+	{ usage: "part #chan", description: "leave a channel (its session is kept)" },
+	{ usage: "sessions", description: "list channel → session" },
+	{ usage: "help", description: "this list" },
+] as const;
+
 export const HELP_LINES = [
-	",join #a,#b — join channels, one session each",
-	",fork #chan [#from] — join #chan with a session forked from #from (default: this channel)",
-	",part #chan — leave a channel (its session is kept)",
-	",sessions — list channel → session",
-	"Talk to me in a channel by addressing my nick (pi: …) or in a DM.",
+	...SESSION_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
+	...CONTROL_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
+	"Mention me to talk (pi: … / … pi …) or DM me; `pi ,model astra` runs a command in a mention.",
 ];
 
 const CHANNEL = /^[#&][^\s,]{1,63}$/;
@@ -47,7 +62,7 @@ export function parseChannelList(text: string): { channels: string[]; invalid: s
 	return { channels, invalid };
 }
 
-/** Parse a line as a control command; undefined when it is not one. */
+/** Parse a line as a command; undefined when it is not one. */
 export function parseCommand(line: string): IrcCommand | undefined {
 	const text = line.trim();
 	if (!text.startsWith(COMMAND_PREFIX)) return undefined;
@@ -55,7 +70,9 @@ export function parseCommand(line: string): IrcCommand | undefined {
 	if (!match) return undefined;
 	const [, name, rest = ""] = match;
 	const argument = rest.trim();
-	switch (name.toLowerCase()) {
+	const session = parseSessionCommand(name!, argument);
+	if (session) return session;
+	switch (name!.toLowerCase()) {
 		case "join": {
 			const { channels, invalid } = parseChannelList(argument);
 			if (invalid.length > 0) return { kind: "error", message: `Not a channel: ${invalid.join(", ")}` };
@@ -85,11 +102,18 @@ export function parseCommand(line: string): IrcCommand | undefined {
 }
 
 /**
- * Whether a channel line is addressed to the bot, and the text without the
- * address. Accepts `nick: text`, `nick, text`, and `@nick text`.
+ * Whether a channel line mentions the bot, and the text to prompt with. A
+ * leading address (`nick: text`, `nick, text`, `@nick text`) is stripped;
+ * a mention anywhere else in the line (`does nick know?`) keeps the whole
+ * line. Matching is case-insensitive on whole words, so `pi` does not match
+ * `piano`. Unmentioned channel chatter is never a prompt.
  */
-export function addressedText(line: string, nick: string): string | undefined {
+export function mentionText(line: string, nick: string): string | undefined {
 	const escaped = nick.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const match = new RegExp(`^\\s*@?${escaped}\\s*[:,]?\\s+([\\s\\S]+)$`, "i").exec(line);
-	return match?.[1]?.trim();
+	const leading = new RegExp(`^\\s*@?${escaped}[:,]\\s*([\\s\\S]*)$`, "i").exec(line);
+	if (leading) return leading[1]?.trim() || undefined;
+	const leadingSpace = new RegExp(`^\\s*@?${escaped}\\s+([\\s\\S]+)$`, "i").exec(line);
+	if (leadingSpace) return leadingSpace[1]?.trim() || undefined;
+	const anywhere = new RegExp(`(^|[^\\w])@?${escaped}(?![\\w])`, "i");
+	return anywhere.test(line) ? line.trim() : undefined;
 }

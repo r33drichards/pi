@@ -12,16 +12,35 @@ with `read`, `write`, and `run_js` on its own empty filesystem snapshot.
 
 ## Talking to it
 
-In a channel, address the bot by nick: `pi: list the files`, `pi, …`, `@pi …`
-(or start with `--all` / `IRC_RESPOND_TO_ALL=1` to react to every line). DMs
-always count. Each line becomes the prompt `[IRC #chan] <nick> text` to that
+In a channel the bot only reacts to lines that mention its nick: a leading
+address (`pi: list the files`, `pi, …`, `@pi …`) is stripped, and a mention
+anywhere else (`does pi know?`) sends the whole line. Matching is
+case-insensitive on whole words, so `piano` and `api` are not mentions.
+Unmentioned chatter is never a prompt. DMs are addressed by nature and always
+count. Reacting to every channel line is an explicit opt-in (`--all` /
+`IRC_RESPOND_TO_ALL=1`) and off by default. Each line becomes the prompt `[IRC #chan] <nick> text` to that
 channel's Session. While a turn runs, further lines are delivered as steering.
 The bot relays every completed assistant message as channel lines, and one
 line per tool call and result (`[run_js] 3 lines: …`, `[read] → hi`).
 
-## Control commands
+## Commands
 
-Comma-prefixed, honored in the control channel (default `#pi`) and DMs:
+Comma-prefixed. Inside a mention they work anywhere (`pi ,model astra`,
+`pi: ,thinking high`); bare `,command` lines are honored in the control
+channel (default `#pi`) and DMs. `,help` lists all of them.
+
+Session commands act on the channel's own Session and are the same set the
+browser composer has as `/model`, `/thinking`, `/compact`, `/reload`
+(shared parser in `session-commands.ts`):
+
+| Command | Effect |
+| --- | --- |
+| `,model [query]` | No query: show the current model and the available ones. With a query: select the first model whose `provider/id name` contains it (case-insensitive), the same filter as the web picker. |
+| `,thinking [level]` | Set the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); no level cycles. |
+| `,compact [instructions]` | Compact the Session context. |
+| `,reload` | Reload the Session's plugins. |
+
+Channel control commands, accepted in the control channel and DMs:
 
 | Command | Effect |
 | --- | --- |

@@ -2,11 +2,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { addressedText, parseChannelList, parseCommand } from "../src/experimental/irc/commands.ts";
+import { mentionText, parseChannelList, parseCommand } from "../src/experimental/irc/commands.ts";
 import { forkEngineSession } from "../src/experimental/irc/engine-fork.ts";
 import { describeToolCall, describeToolResult, framePrompt, toIrcLines } from "../src/experimental/irc/format.ts";
 import { resolveIrcConfig } from "../src/experimental/irc/run.ts";
 import { ChannelSessionStore } from "../src/experimental/irc/state.ts";
+import { filterModels } from "../src/experimental/session-commands.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "pi-irc-test-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -29,19 +30,64 @@ describe("irc control commands", () => {
 		expect(parseCommand(",dance")).toEqual({ kind: "error", message: "Unknown command ,dance. Try ,help" });
 	});
 
+	it("parses session commands, bare or inside a mention", () => {
+		expect(parseCommand(",model astra")).toEqual({ kind: "model", query: "astra" });
+		expect(parseCommand(",model")).toEqual({ kind: "model", query: "" });
+		expect(parseCommand(",thinking high")).toEqual({ kind: "thinking", level: "high" });
+		expect(parseCommand(",thinking")).toEqual({ kind: "thinking", level: undefined });
+		expect(parseCommand(",thinking loud")).toMatchObject({ kind: "error" });
+		expect(parseCommand(",compact keep the plan")).toEqual({ kind: "compact", instructions: "keep the plan" });
+		expect(parseCommand(",reload")).toEqual({ kind: "reload" });
+		// The bot's grammar: strip the mention, then parse the body as a command.
+		const inMention = (line: string) => {
+			const body = mentionText(line, "pi");
+			return body === undefined ? undefined : parseCommand(body);
+		};
+		expect(inMention("pi ,model astra")).toEqual({ kind: "model", query: "astra" });
+		expect(inMention("pi: ,thinking high")).toEqual({ kind: "thinking", level: "high" });
+		expect(inMention("@pi ,compact")).toEqual({ kind: "compact", instructions: null });
+		expect(inMention("pi ,join #dev,#ops")).toEqual({ kind: "join", channels: ["#dev", "#ops"] });
+		expect(inMention("pi ,help")).toEqual({ kind: "help" });
+		// A mention that is not a command stays a prompt; unmentioned commands are not parsed here.
+		expect(inMention("pi model astra")).toBeUndefined();
+		expect(inMention("someone said ,model astra")).toBeUndefined();
+	});
+
+	it("filters models the way the browser picker does", () => {
+		const models = [
+			{ provider: "anthropic", modelId: "claude-sonnet-5", name: "Claude Sonnet 5" },
+			{ provider: "litellm", modelId: "astra-large", name: "Astra" },
+		];
+		expect(filterModels(models, "astra").map((m) => m.modelId)).toEqual(["astra-large"]);
+		expect(filterModels(models, "SONNET").map((m) => m.modelId)).toEqual(["claude-sonnet-5"]);
+		expect(filterModels(models, "")).toHaveLength(2);
+		expect(filterModels(models, "nope")).toEqual([]);
+	});
+
 	it("leaves ordinary lines alone", () => {
 		expect(parseCommand("hello, world")).toBeUndefined();
 		expect(parseCommand("pi: ,join is a command")).toBeUndefined();
 		expect(parseChannelList("#x,, #y")).toEqual({ channels: ["#x", "#y"], invalid: [] });
 	});
 
-	it("detects lines addressed to the bot", () => {
-		expect(addressedText("pi: list files", "pi")).toBe("list files");
-		expect(addressedText("Pi, list files", "pi")).toBe("list files");
-		expect(addressedText("@pi list files", "pi")).toBe("list files");
-		expect(addressedText("pi list files", "pi")).toBe("list files");
-		expect(addressedText("piano is nice", "pi")).toBeUndefined();
-		expect(addressedText("what about pi?", "pi")).toBeUndefined();
+	it("prompts only on lines that mention the bot", () => {
+		// Leading address forms are stripped.
+		expect(mentionText("pi: list files", "pi")).toBe("list files");
+		expect(mentionText("Pi, list files", "pi")).toBe("list files");
+		expect(mentionText("@pi list files", "pi")).toBe("list files");
+		expect(mentionText("PI list files", "pi")).toBe("list files");
+		// A mention anywhere else keeps the whole line.
+		expect(mentionText("hey does pi know the answer?", "pi")).toBe("hey does pi know the answer?");
+		expect(mentionText("what about pi?", "pi")).toBe("what about pi?");
+		expect(mentionText("thanks @pi", "pi")).toBe("thanks @pi");
+		// Unmentioned chatter and partial-word matches are never prompts.
+		expect(mentionText("piano is nice", "pi")).toBeUndefined();
+		expect(mentionText("the api is down", "pi")).toBeUndefined();
+		expect(mentionText("just chatting here", "pi")).toBeUndefined();
+		expect(mentionText("pi:", "pi")).toBeUndefined();
+		// Nicks with regex characters are matched literally.
+		expect(mentionText("pi.bot: hi", "pi.bot")).toBe("hi");
+		expect(mentionText("pixbot: hi", "pi.bot")).toBeUndefined();
 	});
 });
 
