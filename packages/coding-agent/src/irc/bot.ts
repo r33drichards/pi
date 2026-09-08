@@ -9,10 +9,10 @@
  * this object instead of going through a control socket.
  */
 
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
 import type { ModelRuntime } from "../core/model-runtime.ts";
-import type { ResourceLoader } from "../core/resource-loader.ts";
-import type { SettingsManager } from "../core/settings-manager.ts";
 import { ChannelSession, type ChannelSessionDeps } from "./channel-session.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
 import { type EngineForkOptions, forkEngineSession, type MergeStrategy, mergeEngineSessions } from "./engine-fork.ts";
@@ -34,11 +34,13 @@ export interface IrcBotOptions {
 	/** Only react to channel lines that mention the bot (DMs always count). Default and recommended: true. */
 	addressedOnly: boolean;
 	statePath: string;
+	/** Where per-channel working directories live; each channel gets its own. */
+	workspaceRoot: string;
 	cwd: string;
 	agentDir: string;
 	sessionDir: string;
-	settingsManager: SettingsManager;
-	resourceLoader: ResourceLoader;
+	/** Extensions and settings, built fresh for each channel's working directory. */
+	createResources: ChannelSessionDeps["createResources"];
 	modelRuntime: ModelRuntime;
 	/** When set, channels get mcp-js sandbox tools and `,fork`/`,merge` carry files. */
 	engineFork?: EngineForkOptions;
@@ -100,13 +102,24 @@ export class IrcPiBot implements ChannelDelegate {
 		return this.#store;
 	}
 
-	#deps(): ChannelSessionDeps {
+	/**
+	 * A channel's own working directory. Extensions keep project-local state
+	 * under `cwd` — pi-schedule-prompt's job store, for one — so channels
+	 * sharing a directory would race over each other's files.
+	 */
+	#cwdFor(channel: string): string {
+		const safe = channel.replace(/^[#&]/, "").replace(/[^a-z0-9._-]/gi, "_") || "default";
+		const dir = join(this.#options.workspaceRoot, safe);
+		mkdirSync(dir, { recursive: true });
+		return dir;
+	}
+
+	#deps(channel: string): ChannelSessionDeps {
 		return {
-			cwd: this.#options.cwd,
+			cwd: this.#cwdFor(channel),
 			agentDir: this.#options.agentDir,
 			sessionDir: this.#options.sessionDir,
-			settingsManager: this.#options.settingsManager,
-			resourceLoader: this.#options.resourceLoader,
+			createResources: this.#options.createResources,
 			modelRuntime: this.#options.modelRuntime,
 			delegate: this,
 			...(this.#options.engineFork === undefined ? {} : { engine: this.#options.engineFork }),
@@ -173,11 +186,20 @@ export class IrcPiBot implements ChannelDelegate {
 		const next = previous.then(async () => {
 			for (const line of lines) {
 				if (this.#closed) return;
-				this.#irc.say(target, line);
+				try {
+					this.#irc.say(target, line);
+				} catch (error) {
+					// One failed line must not silence the channel: the queue is
+					// chained, so a rejection here would skip every later send.
+					this.#options.log(`IRC: send to ${target} failed: ${message(error)}`);
+				}
 				await new Promise((resolve) => setTimeout(resolve, spacing));
 			}
 		});
-		this.#sendQueues.set(target, next);
+		this.#sendQueues.set(
+			target,
+			next.catch(() => {}),
+		);
 	}
 
 	/** The relay that puts a channel's session activity into that channel. */
@@ -199,7 +221,7 @@ export class IrcPiBot implements ChannelDelegate {
 			const record = this.#store.get(key);
 			if (record?.sessionFile) {
 				try {
-					return await ChannelSession.open(key, this.#deps(), { sessionFile: record.sessionFile });
+					return await ChannelSession.open(key, this.#deps(key), { sessionFile: record.sessionFile });
 				} catch (error) {
 					this.#options.log(
 						`IRC: ${key}: could not reopen session ${record.sessionId} (${message(error)}); starting a new one`,
@@ -207,7 +229,7 @@ export class IrcPiBot implements ChannelDelegate {
 					this.#store.delete(key);
 				}
 			}
-			const created = await ChannelSession.open(key, this.#deps());
+			const created = await ChannelSession.open(key, this.#deps(key));
 			this.#store.set(key, {
 				sessionId: created.sessionId,
 				sessionFile: created.sessionFile,
@@ -254,7 +276,7 @@ export class IrcPiBot implements ChannelDelegate {
 		const session = await this.#sessionFor(room);
 		const prompt = this.#framePromptFor(room, isDm ? `dm:${event.nick}` : room, event.nick, body);
 		if (session.busy) this.say(room, `(steering the running turn)`);
-		await session.prompt(prompt, this.#relayTo(room));
+		await session.prompt(prompt);
 	}
 
 	/** The prompt text a session sees, with a one-time fork notice when it has just been forked. */
@@ -426,7 +448,7 @@ export class IrcPiBot implements ChannelDelegate {
 			);
 		}
 		const source = await this.#sessionFor(room);
-		const created = await ChannelSession.open(channel, this.#deps(), { forkFrom: source.sessionFile });
+		const created = await ChannelSession.open(channel, this.#deps(channel), { forkFrom: source.sessionFile });
 		let note = "conversation carried over";
 		let forkBaseFs: string | undefined;
 		if (this.#options.engineFork) {
@@ -511,13 +533,14 @@ export class IrcPiBot implements ChannelDelegate {
 		this.say(room, `spawned ${channel} (session ${forked.sessionId}; ${forked.note})`);
 		const session = await this.#sessionFor(channel);
 		const timeoutMs = (request.timeoutSeconds ?? 0) * 1000 || this.#options.spawnTimeoutMs || 600_000;
+		// The child channel already relays its own output; this only captures the
+		// text so a timed-out spawn can still return what the child managed to say.
 		let partial = "";
-		const relay = {
+		const capture = {
 			text: (lines: string[]) => {
 				partial = lines.join("\n");
-				this.say(channel, lines);
 			},
-			tool: (line: string) => this.say(channel, line),
+			tool: () => {},
 		};
 		this.say(channel, `[from ${room}] ${request.prompt}`.split("\n"));
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -526,7 +549,7 @@ export class IrcPiBot implements ChannelDelegate {
 		});
 		try {
 			const prompt = this.#framePromptFor(channel, channel, room, request.prompt);
-			const outcome = await Promise.race([session.prompt(prompt, relay).then((result) => result.text), timeout]);
+			const outcome = await Promise.race([session.prompt(prompt, capture).then((result) => result.text), timeout]);
 			if (outcome === "timeout") {
 				await session.abort().catch(() => {});
 				return { channel, sessionId: forked.sessionId, status: "timeout", text: partial };
@@ -562,9 +585,7 @@ export class IrcPiBot implements ChannelDelegate {
 		const mentioned = mentionText(request.text, this.#nick);
 		if (mentioned !== undefined && channel !== room && isChannel(channel)) {
 			void this.#sessionFor(channel)
-				.then((session) =>
-					session.prompt(this.#framePromptFor(channel, channel, room, mentioned), this.#relayTo(channel)),
-				)
+				.then((session) => session.prompt(this.#framePromptFor(channel, channel, room, mentioned)))
 				.catch((error) => this.say(channel, `error: ${message(error)}`));
 		}
 	}

@@ -32,8 +32,12 @@ export interface ChannelSessionDeps {
 	cwd: string;
 	agentDir: string;
 	sessionDir: string;
-	settingsManager: SettingsManager;
-	resourceLoader: ResourceLoader;
+	/**
+	 * Built per channel, not shared: an extension is one instance per loader,
+	 * and several of them keep project-local state under `cwd`. Sharing a
+	 * loader would give every channel the first channel's extension state.
+	 */
+	createResources: (cwd: string) => Promise<{ resourceLoader: ResourceLoader; settingsManager: SettingsManager }>;
 	modelRuntime: ModelRuntime;
 	delegate: ChannelDelegate;
 	/** The mcp-js coordinator backing every channel's sandbox. */
@@ -122,12 +126,13 @@ export class ChannelSession {
 		}
 		customTools.push(...createDelegationTools(deps.delegate, channel));
 
+		const { resourceLoader, settingsManager } = await deps.createResources(deps.cwd);
 		const { session } = await createAgentSession({
 			cwd: deps.cwd,
 			agentDir: deps.agentDir,
 			modelRuntime: deps.modelRuntime,
-			settingsManager: deps.settingsManager,
-			resourceLoader: deps.resourceLoader,
+			settingsManager,
+			resourceLoader,
 			sessionManager,
 			// The sandbox tools replace pi's host-filesystem built-ins; extension
 			// tools stay enabled, which is what "builtin" means here.
@@ -206,13 +211,15 @@ export class ChannelSession {
 	 * delivered as steering instead of queueing, so the model sees it while it
 	 * works.
 	 */
-	async prompt(message: string, relay: RelayEvents): Promise<{ text: string; steered: boolean }> {
+	async prompt(message: string, relay?: RelayEvents): Promise<{ text: string; steered: boolean }> {
 		if (this.#depth > 0) {
 			await this.session.steer(message);
 			return { text: "", steered: true };
 		}
 		this.#depth += 1;
-		const stop = this.watch(relay);
+		// The channel's own relay is already attached for the session's lifetime;
+		// an extra one here is only for callers that need to capture the text.
+		const stop = relay ? this.watch(relay) : () => {};
 		const run = this.#running.then(async () => {
 			await this.session.prompt(message);
 			return this.session.getLastAssistantText() ?? "";

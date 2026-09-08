@@ -22,6 +22,8 @@ export interface IrcCommand {
 	readonly all?: boolean;
 	readonly stateDir?: string;
 	readonly sessionDir?: string;
+	/** Parent of the per-channel working directories. */
+	readonly workspaceRoot?: string;
 	readonly cwd?: string;
 }
 
@@ -91,9 +93,15 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 	const config = resolveIrcConfig(command, env, agentDir);
 	const sessionDir = command.sessionDir ?? env.PI_IRC_SESSION_DIR ?? join(agentDir, "irc", "sessions");
 
-	const settingsManager = SettingsManager.create(cwd, agentDir);
-	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
-	await resourceLoader.reload();
+	// One loader per channel: extensions are instantiated per loader and several
+	// keep state under `cwd`, so a shared one would leak between channels.
+	const createResources = async (channelCwd: string) => {
+		const settingsManager = SettingsManager.create(channelCwd, agentDir);
+		const resourceLoader = new DefaultResourceLoader({ cwd: channelCwd, agentDir, settingsManager });
+		await resourceLoader.reload();
+		return { resourceLoader, settingsManager };
+	};
+	const { resourceLoader } = await createResources(cwd);
 	const extensions = resourceLoader.getExtensions();
 	if (extensions.extensions.length > 0) {
 		log(`Extensions: ${extensions.extensions.length} loaded`);
@@ -121,10 +129,10 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 	const botOptions: IrcBotOptions = {
 		...config,
 		cwd,
+		workspaceRoot: command.workspaceRoot ?? env.PI_IRC_WORKSPACE_DIR ?? join(agentDir, "irc", "channels"),
 		agentDir,
 		sessionDir,
-		settingsManager,
-		resourceLoader,
+		createResources,
 		modelRuntime,
 		...(engineFork === undefined ? {} : { engineFork, engineHeap }),
 		...(guestNetwork === undefined && guestModules === undefined
@@ -138,6 +146,19 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 		log,
 	};
 	const bot = new IrcPiBot(botOptions);
+	// An extension's background timer must not take the bot down with it. The
+	// classic runtime expects one session per process; here there is one per
+	// channel, and an extension holding a captured context across sessions can
+	// throw from a timer long after the call that created it.
+	const onFault = (kind: string) => (error: unknown) => {
+		log(
+			`IRC: uncaught ${kind} (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+		);
+	};
+	const onUncaught = onFault("exception");
+	const onRejection = onFault("rejection");
+	process.on("uncaughtException", onUncaught);
+	process.on("unhandledRejection", onRejection);
 	try {
 		log(
 			`IRC: connecting to ${config.server}:${config.port}${config.tls ? " (tls)" : ""} as ${config.nick}, control ${config.controlChannel}`,
@@ -161,6 +182,8 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 			void options.stop?.then(finish, fail);
 		});
 	} finally {
+		process.off("uncaughtException", onUncaught);
+		process.off("unhandledRejection", onRejection);
 		await bot.close();
 	}
 }
