@@ -127,14 +127,24 @@ export interface Tracker<T extends object> {
 }
 
 const isObj = (value: unknown): value is object => value !== null && typeof value === "object";
+/**
+ * Property keys of an object whose value is present. A property set to
+ * `undefined` is treated as absent, exactly as JSON serialization treats it,
+ * so an assigned object that carries optional properties left `undefined`
+ * (`{ details: undefined }`) never produces a non-JSON op.
+ */
+const presentKeys = (value: object): string[] =>
+	Object.keys(value).filter((key) => (value as Record<string, unknown>)[key] !== undefined);
+
 const cloneJson = <T extends JsonValue>(value: T): T => {
-	if (!isObj(value)) return value;
+	if (!isObj(value)) return (value === undefined ? null : value) as T;
 	if (Array.isArray(value)) return value.map((item) => cloneJson(item)) as T;
 	const result = Object.create(Object.getPrototypeOf(value) === null ? null : Object.prototype) as Record<
 		string,
 		JsonValue
 	>;
-	for (const [key, child] of Object.entries(value)) {
+	for (const key of presentKeys(value)) {
+		const child = (value as Record<string, JsonValue>)[key]!;
 		Object.defineProperty(result, key, {
 			value: cloneJson(child),
 			writable: true,
@@ -177,11 +187,11 @@ const jsonEqual = (left: JsonValue, right: JsonValue): boolean => {
 	}
 	const leftObject = left as Record<string, JsonValue>;
 	const rightObject = right as Record<string, JsonValue>;
-	const leftKeys = Object.keys(leftObject);
-	const rightKeys = Object.keys(rightObject);
+	const leftKeys = presentKeys(leftObject);
+	const rightKeys = presentKeys(rightObject);
 	if (leftKeys.length !== rightKeys.length) return false;
 	for (const key of leftKeys) {
-		if (!Object.hasOwn(rightObject, key) || !jsonEqual(leftObject[key]!, rightObject[key]!)) return false;
+		if (rightObject[key] === undefined || !jsonEqual(leftObject[key]!, rightObject[key]!)) return false;
 	}
 	return true;
 };
@@ -262,11 +272,13 @@ function diffObject(
 		emitSet(path, after, out);
 		return;
 	}
+	const present = (object: Record<string, JsonValue>, key: string): MaybeJson =>
+		object[key] === undefined ? MISSING : object[key]!;
 	for (const key of Object.keys(after)) {
-		diffValue(Object.hasOwn(before, key) ? before[key]! : MISSING, after[key]!, [...path, key], scan, out);
+		diffValue(present(before, key), present(after, key), [...path, key], scan, out);
 	}
 	for (const key of Object.keys(before)) {
-		if (!Object.hasOwn(after, key)) emitDelete([...path, key], out);
+		if (after[key] === undefined && before[key] !== undefined) emitDelete([...path, key], out);
 	}
 }
 
