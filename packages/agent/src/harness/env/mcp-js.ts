@@ -58,7 +58,7 @@ export interface McpJsNativeEngine {
 		lineLimit: undefined,
 		byteOffset: undefined,
 		byteLimit: undefined,
-	): { data: string };
+	): { data: string } | Promise<{ data: string }>;
 	cancelExecution(executionId: string): void;
 	capabilities(): { heap: boolean; filesystem: boolean; sessions: boolean };
 	hostFilesystemEnabled(): boolean;
@@ -230,7 +230,8 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 			signal?.removeEventListener("abort", cancel);
 		}
 		if (typeof info.status !== "string") throw new Error("Invalid native execution record");
-		const output = this.engine.getExecutionOutput(executionId, undefined, undefined, undefined, undefined).data;
+		const page = await this.engine.getExecutionOutput(executionId, undefined, undefined, undefined, undefined);
+		const output = page.data;
 		if (typeof output !== "string") throw new Error("Invalid native output");
 		if (info.status === "completed") return { output, error: undefined };
 		const error = typeof info.error === "string" && info.error.length > 0 ? info.error : `execution ${info.status}`;

@@ -38,6 +38,7 @@ import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
+import { createMcpJsEnvironmentFactory } from "./mcp-js-env.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
@@ -964,7 +965,7 @@ export async function createCodingAgentHarness(
 }
 
 export function runSessionWorkerProcess(args: readonly string[]): Promise<void> {
-	return runSessionWorkerWithHarness(args, createCodingAgentHarness);
+	return runSessionWorkerWithHarness(args, createCodingAgentHarness, createMcpJsEnvironmentFactory());
 }
 
 if (isDirectInternalProcessEntry(import.meta.url)) {

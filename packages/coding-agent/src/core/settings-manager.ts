@@ -91,8 +91,44 @@ export type PackageSource =
 			themes?: string[];
 	  };
 
+/**
+ * Run the experimental session worker on the mcp-js engine instead of the host
+ * shell. `standalone` embeds the engine through generated native bindings;
+ * `coordinator` talks to an mcp-js HTTP server or cluster. Either way the pi
+ * session id is the engine session name, so the session's heap and filesystem
+ * snapshot follow the pi session.
+ */
+export interface McpJsSettings {
+	mode: "standalone" | "coordinator";
+	/** Standalone: path to the generated UniFFI Node bindings module (its `index.js`). */
+	bindings?: string;
+	/** Standalone: engine data directory for the session log and stores (default: `<agentDir>/mcp-js`). */
+	dataDir?: string;
+	/** Standalone: path to the filesystem Rego policy, or a policies JSON object. */
+	policy?: string;
+	/** Standalone: persist V8 heaps between runs (default: true). Incompatible with `wasmModules`. */
+	heap?: boolean;
+	/** Standalone: keep per-session filesystem snapshots (default: true). */
+	snapshots?: boolean;
+	/** Standalone: WebAssembly modules to pre-load, as name to `.wasm` path. */
+	wasmModules?: Record<string, string>;
+	/** Standalone: V8 heap limit in MiB (default: 256). */
+	heapMemoryMaxMb?: number;
+	/** Default execution deadline in seconds (default: 60). */
+	executionTimeoutSecs?: number;
+	/** Coordinator: base URL of the server, for example `http://node1:3000`. */
+	url?: string;
+	/** Coordinator: headers sent with every request, such as authorization. */
+	headers?: Record<string, string>;
+	/** Which namespace the file tools address: the session snapshot, or the host filesystem. */
+	files?: "session" | "host";
+	/** Working directory inside the session snapshot (default: `/work`). */
+	snapshotCwd?: string;
+}
+
 export interface Settings {
 	lastChangelogVersion?: string;
+	mcpJs?: McpJsSettings; // Run the session worker on mcp-js: "standalone" (native bindings) or "coordinator" (HTTP)
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
@@ -716,6 +752,10 @@ export class SettingsManager {
 
 	getDefaultProvider(): string | undefined {
 		return this.settings.defaultProvider;
+	}
+
+	getMcpJs(): McpJsSettings | undefined {
+		return this.settings.mcpJs;
 	}
 
 	getDefaultModel(): string | undefined {

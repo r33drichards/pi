@@ -141,42 +141,70 @@ configuration or an OS sandbox. Policies must address traversal, symlinks, and
 every relevant operation; `run_js` can pass raw paths directly to `fs.*`. The
 adapter's path normalization is not a security boundary.
 
-## Coding agent opt-in
+## Coding agent: standalone or coordinator
 
-The experimental session worker chooses its tools from the environment it is
-given: `createSessionWorkerTools(env)` returns read, write, and bash for an
-environment with a shell, and read, write, and `run_js` for one that only runs
-JavaScript. To run the coding agent's session worker on mcp-js, write an entry
-module that imports your generated bindings and pass it as the worker's
-`entryUrl` (`spawnInternalProcess` option). The experimental worker is not part
-of the published package, so the entry lives in a checkout of this repository,
-the way `packages/coding-agent/test/fixtures/faux-session-worker.ts` does:
+The experimental session worker picks its environment from the `mcpJs`
+setting in pi's settings file. Without it, the worker keeps `NodeExecutionEnv`
+and bash. With it, the pi session id becomes the engine session name, so the
+session's heap and filesystem snapshot follow the pi session, and pi's own
+session files stay on the host. `createSessionWorkerTools(env)` then offers
+read, write, and `run_js` instead of bash.
 
-```ts
-import { McpJsExecutionEnv } from "@earendil-works/pi-agent-core/node";
-import { createCodingAgentHarness, runSessionWorkerWithHarness } from "../src/experimental/session-worker.ts";
-import { Engine } from "./generated/index";
+Standalone: the worker embeds the engine through generated native bindings.
 
-void runSessionWorkerWithHarness(process.argv.slice(2), createCodingAgentHarness, async (cwd, sessionId) => {
-  const engine = Engine.create(config); // see the builder example above
-  return {
-    execution: new McpJsExecutionEnv(engine, cwd, { session: sessionId }),
-    sessionStore: new NodeExecutionEnv({ cwd }), // keep pi's session files on the host
-  };
-});
+```json
+{
+  "mcpJs": {
+    "mode": "standalone",
+    "bindings": "/path/to/mcp-js/node/generated/index.js",
+    "policy": "filesystem.rego",
+    "dataDir": "/var/lib/pi/mcp-js",
+    "heap": true,
+    "snapshots": true,
+    "heapMemoryMaxMb": 256,
+    "executionTimeoutSecs": 60
+  }
+}
 ```
 
-The default entry keeps `NodeExecutionEnv` and bash. The factory receives the
-pi session id, which the example uses as the engine session name so the
-session's heap and snapshot follow the pi session. Returning a
-`sessionStore` keeps pi's own session files on the host; returning only an
-environment stores them through it, in which case the policy must allow the
-sessions root.
+`policy` is a Rego file path (relative to the agent directory) or a policies
+JSON object for the `filesystem` entry. `heap` and `snapshots` default to
+true; `wasmModules` (name to `.wasm` path) pre-loads modules and, because an
+engine cannot have both, turns the heap store off. `snapshotCwd` (default
+`/work`) is the file tools' working directory inside the snapshot; `files:
+"host"` keeps them on the host filesystem instead.
+
+Coordinator: the worker talks to an mcp-js HTTP server or cluster over
+`McpJsHttpEngine`. `run_js` is submitted to `/api/exec` with the session
+name and awaited; the file tools use the server's session file endpoints
+(`/api/sessions/{session}/files`, `entries`, `dir`, `fs`, `snapshots`).
+
+```json
+{
+  "mcpJs": {
+    "mode": "coordinator",
+    "url": "http://node1:3000",
+    "headers": { "authorization": "Bearer ..." }
+  }
+}
+```
+
+The server must have filesystem snapshots configured; there is no host
+filesystem view over HTTP. Because heaps and snapshots are content-addressed,
+a session can move between a standalone engine and a cluster when they share
+a blob store.
+
+For an embedding that builds its own environment, `runSessionWorkerWithHarness`
+still takes a factory `(cwd, sessionId) => environment`, and
+`createMcpJsEnvironmentFactory` accepts injected loaders for tests.
 
 ## Verification
 
 - `test/harness/mcp-js.test.ts` checks adapter behavior against an in-memory
-  engine with the native method shapes and error messages.
+  engine with the native method shapes and error messages;
+  `test/harness/mcp-js-http.test.ts` checks the HTTP engine against a fake
+  server; the coding agent's `experimental-mcp-js-env.test.ts` checks the
+  settings-driven factory.
 - mcp-js's `node/tests/filesystem.test.ts` checks the native methods against
   the generated bindings, including guest/native parity through a rewriting
   pre hook.
