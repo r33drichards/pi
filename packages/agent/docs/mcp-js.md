@@ -80,6 +80,35 @@ console.log(await fs.readFile("/work/notes.txt", "utf8"));
 
 `cwd` resolves file-tool paths; it does not change the native process cwd.
 
+## Binding a pi session to engine state
+
+The engine keeps per-session state in its session log: with a session name,
+`run_js` resumes the session's latest heap (when the engine has `heapStore`)
+and filesystem snapshot (when it has `fsSnapshotStore`) and records the run.
+The adapter binds to that with one option:
+
+```ts
+const env = new McpJsExecutionEnv(engine, "/work", { session: sessionId });
+```
+
+- `run_js` is called with the session id, so the heap and snapshot persist
+  across runs and across processes without pi tracking any hashes. On a
+  stateful engine the tool answers with an execution id; the adapter awaits it
+  natively (`awaitExecution`), reads the console output, and cancels the
+  execution if the caller aborts.
+- The file tools address the session's snapshot through
+  `engine.fsView(sessionId)`, the same snapshot `run_js` mounts, so a written
+  file is visible to the next run and a guest write to the next read. Each
+  mutating call folds into a new snapshot recorded in the session log with the
+  session's current heap. `cwd` is a path inside the snapshot, for example
+  `/work`.
+- `files: "host"` keeps the file tools on the host filesystem while `run_js`
+  still resumes the session's heap. Without `fsSnapshotStore` that is the
+  default.
+- An engine with `wasmModules` cannot have a heap store, so on such an engine
+  the session persists only its filesystem; the choice is per engine, not per
+  call.
+
 ## What the adapter does
 
 - File tools call the typed native methods directly. No JavaScript is generated
@@ -103,6 +132,8 @@ console.log(await fs.readFile("/work/notes.txt", "utf8"));
   in-flight native file calls, then releases the native handle
   (`uniffiDestroy` is optional on the boundary because the generated
   constructor returns an `EngineLike`).
+- On a stateful engine, `run_js` answers with an execution id; the adapter
+  awaits it natively and cancels it when the caller aborts.
 
 The engine must be exclusively owned by the adapter. Guest heaps are stateless,
 while host files persist across calls. This is not a snapshot/overlay filesystem
@@ -126,16 +157,21 @@ import { McpJsExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { createCodingAgentHarness, runSessionWorkerWithHarness } from "../src/experimental/session-worker.ts";
 import { Engine } from "./generated/index";
 
-void runSessionWorkerWithHarness(process.argv.slice(2), createCodingAgentHarness, async (cwd) => {
-  const engine = Engine.createWithFilesystem(64n, 30n, JSON.stringify({
-    policies: [{ url: "file:///absolute/path/filesystem.rego" }],
-  }));
-  return new McpJsExecutionEnv(engine, cwd);
+void runSessionWorkerWithHarness(process.argv.slice(2), createCodingAgentHarness, async (cwd, sessionId) => {
+  const engine = Engine.create(config); // see the builder example above
+  return {
+    execution: new McpJsExecutionEnv(engine, cwd, { session: sessionId }),
+    sessionStore: new NodeExecutionEnv({ cwd }), // keep pi's session files on the host
+  };
 });
 ```
 
-The default entry keeps `NodeExecutionEnv` and bash. The session store uses
-the same environment's filesystem, so the policy must allow the sessions root.
+The default entry keeps `NodeExecutionEnv` and bash. The factory receives the
+pi session id, which the example uses as the engine session name so the
+session's heap and snapshot follow the pi session. Returning a
+`sessionStore` keeps pi's own session files on the host; returning only an
+environment stores them through it, in which case the policy must allow the
+sessions root.
 
 ## Verification
 
@@ -157,8 +193,7 @@ the same environment's filesystem, so the policy must allow the sessions root.
   tool-side truncation. No source-side bounded streaming or durable progress
   checkpoints.
 - `readTextFile`, `readBinaryFile`, and `edit` load whole files.
-- The adapter does not yet pass `heap`, `fs`, or `session` to `run_js`, so a
-  heap-persistent engine still runs each call from a fresh heap; binding a pi
-  session to a heap and a filesystem label is the next step.
-- Overlay-backed (session snapshot) engines are not supported by the native
-  file methods, so the adapter only works with host-backed engines.
+- Concurrent `run_js` calls on the same engine session from other clients are
+  not coordinated with this adapter's file operations; the engine serializes
+  its native session mutations, but a run and a native write racing on the
+  same session fold from the same base.

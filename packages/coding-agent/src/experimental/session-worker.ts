@@ -489,6 +489,7 @@ async function closeResources(resources: {
 	session?: Session<JsonlSessionMetadata>;
 	repo: JsonlSessionRepo;
 	executionEnv: SessionWorkerExecutionEnv;
+	sessionStore?: FileSystem;
 	releaseOwnership: () => Promise<void>;
 }): Promise<void> {
 	const errors: unknown[] = [];
@@ -513,6 +514,13 @@ async function closeResources(resources: {
 	} catch (error) {
 		errors.push(error);
 	}
+	if (resources.sessionStore && resources.sessionStore !== resources.executionEnv) {
+		try {
+			await resources.sessionStore.cleanup(TODO_CONTEXT);
+		} catch (error) {
+			errors.push(error);
+		}
+	}
 	try {
 		await resources.releaseOwnership();
 	} catch (error) {
@@ -535,10 +543,35 @@ export type CreateSessionWorkerHarness = (
 	executionEnv: SessionWorkerExecutionEnv,
 ) => Promise<SessionWorkerRuntime>;
 
-/** Build the execution environment for a session's working directory. */
-export type CreateSessionWorkerExecutionEnv = (cwd: string) => Promise<SessionWorkerExecutionEnv>;
+/**
+ * The environments a session worker runs with: the execution environment the
+ * tools use, and the filesystem the session store (`JsonlSessionRepo`) writes
+ * to. They are the same object by default. A JavaScript-only execution
+ * environment bound to an engine session keeps the session store on the host
+ * by supplying a separate `sessionStore`.
+ */
+export interface SessionWorkerEnvironments {
+	execution: SessionWorkerExecutionEnv;
+	sessionStore?: FileSystem;
+}
+
+/**
+ * Build the environments for a session. `sessionId` is the pi session id, so an
+ * environment that binds to per-session engine state (a heap and a filesystem
+ * snapshot) can use it as the engine session name.
+ */
+export type CreateSessionWorkerExecutionEnv = (
+	cwd: string,
+	sessionId: string,
+) => Promise<SessionWorkerExecutionEnv | SessionWorkerEnvironments>;
 
 const createNodeExecutionEnv: CreateSessionWorkerExecutionEnv = async (cwd) => new NodeExecutionEnv({ cwd });
+
+function isEnvironments(
+	value: SessionWorkerExecutionEnv | SessionWorkerEnvironments,
+): value is SessionWorkerEnvironments {
+	return "execution" in value && typeof value.execution === "object";
+}
 
 function hasShell(env: SessionWorkerExecutionEnv): env is FileSystem & ExecutionEnv {
 	return "exec" in env && typeof env.exec === "function";
@@ -582,8 +615,11 @@ async function run(
 		update: 1_000,
 		retries: { retries: 320, factor: 1, minTimeout: 25, maxTimeout: 25, maxRetryTime: 8_000 },
 	});
-	const executionEnv = await createExecutionEnv(metadata.cwd);
-	const repo = new JsonlSessionRepo({ fileSystem: executionEnv, sessionsRoot: sessionDir });
+	const created = await createExecutionEnv(metadata.cwd, metadata.id);
+	const environments: SessionWorkerEnvironments = isEnvironments(created) ? created : { execution: created };
+	const executionEnv = environments.execution;
+	const sessionStore = environments.sessionStore ?? executionEnv;
+	const repo = new JsonlSessionRepo({ fileSystem: sessionStore, sessionsRoot: sessionDir });
 	let session: Session<JsonlSessionMetadata> | undefined;
 	let harness: AgentHarnessInstance | undefined;
 	let lane: AgentLane | undefined;
@@ -610,7 +646,7 @@ async function run(
 		});
 	} catch (error) {
 		try {
-			await closeResources({ harness, services, session, repo, executionEnv, releaseOwnership });
+			await closeResources({ harness, services, session, repo, executionEnv, sessionStore, releaseOwnership });
 		} catch (cleanupError) {
 			throw new AggregateError([error, cleanupError], "Session worker startup and cleanup failed");
 		}
@@ -632,7 +668,7 @@ async function run(
 		activeRequests.clear();
 		for (const remove of removeLifecycleListeners) remove();
 		removeLifecycleListeners = [];
-		closing = closeResources({ harness, services, repo, executionEnv, releaseOwnership });
+		closing = closeResources({ harness, services, repo, executionEnv, sessionStore, releaseOwnership });
 		return closing;
 	};
 	const closeAndExit = (): void => {

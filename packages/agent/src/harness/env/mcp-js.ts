@@ -12,31 +12,73 @@ export interface McpJsNativeMetadata {
 	modifiedMs?: number;
 }
 
+/** One filesystem namespace of the native engine (UniFFI `FsView`). */
+export interface McpJsNativeFsView {
+	readFile(path: string): Promise<ArrayBuffer>;
+	readFileRange(path: string, offset: bigint, maxBytes: bigint): Promise<ArrayBuffer>;
+	readTextFile(path: string): Promise<string>;
+	writeFile(path: string, data: ArrayBuffer): Promise<void>;
+	appendFile(path: string, data: ArrayBuffer): Promise<void>;
+	stat(path: string): Promise<McpJsNativeMetadata>;
+	lstat(path: string): Promise<McpJsNativeMetadata>;
+	readDir(path: string): Promise<string[]>;
+	canonicalPath(path: string): Promise<string>;
+	makeDir(path: string, recursive: boolean): Promise<void>;
+	remove(path: string, recursive: boolean): Promise<void>;
+	rename(from: string, to: string): Promise<void>;
+	exists(path: string): Promise<boolean>;
+}
+
+/** Execution record returned by the native engine (UniFFI `ExecutionInfo`). */
+export interface McpJsNativeExecution {
+	status: string;
+	error?: string;
+	heap?: string;
+	fs?: string;
+}
+
 /**
  * Structural boundary for the generated native UniFFI Engine created with
- * `createWithFilesystem`: `run_js` through the tool API, files through the typed
- * `fs*` methods. No HTTP or subprocess transport, no generated JavaScript for
- * file access. Bytes cross as ArrayBuffers; failures reject with the same message
- * the guest `fs.*` wrapper reports, including its Node-style code token.
+ * `Engine.create`: `run_js` through the tool API, files through a typed view.
+ * No HTTP or subprocess transport, no generated JavaScript for file access.
+ * Bytes cross as ArrayBuffers; failures reject with the same message the guest
+ * `fs.*` wrapper reports, including its Node-style code token.
  */
 export interface McpJsNativeEngine {
-	callToolAsync(name: string, argumentsJson: string, sessionId: undefined, headers: undefined): Promise<string>;
+	callToolAsync(
+		name: string,
+		argumentsJson: string,
+		sessionId: string | undefined,
+		headers: undefined,
+	): Promise<string>;
+	awaitExecution(executionId: string): Promise<McpJsNativeExecution>;
+	getExecutionOutput(
+		executionId: string,
+		lineOffset: undefined,
+		lineLimit: undefined,
+		byteOffset: undefined,
+		byteLimit: undefined,
+	): { data: string };
+	cancelExecution(executionId: string): void;
+	capabilities(): { heap: boolean; filesystem: boolean; sessions: boolean };
 	hostFilesystemEnabled(): boolean;
-	fsReadFile(path: string): Promise<ArrayBuffer>;
-	fsReadFileRange(path: string, offset: bigint, maxBytes: bigint): Promise<ArrayBuffer>;
-	fsReadTextFile(path: string): Promise<string>;
-	fsWriteFile(path: string, data: ArrayBuffer): Promise<void>;
-	fsAppendFile(path: string, data: ArrayBuffer): Promise<void>;
-	fsStat(path: string): Promise<McpJsNativeMetadata>;
-	fsLstat(path: string): Promise<McpJsNativeMetadata>;
-	fsReadDir(path: string): Promise<string[]>;
-	fsCanonicalPath(path: string): Promise<string>;
-	fsMakeDir(path: string, recursive: boolean): Promise<void>;
-	fsRemove(path: string, recursive: boolean): Promise<void>;
-	fsRename(from: string, to: string): Promise<void>;
-	fsExists(path: string): Promise<boolean>;
+	fsView(session: string | undefined): McpJsNativeFsView;
 	close(): unknown;
 	uniffiDestroy?(): void;
+}
+
+/**
+ * How an environment binds to engine state. `session` is the engine session
+ * name: `run_js` resumes that session's latest heap (when the engine has a heap
+ * store) and filesystem snapshot from the engine's session log, and records
+ * each run there. `files` selects the namespace the file tools address:
+ * `"session"` (the default with a session on an engine with a snapshot store)
+ * is the session's snapshot, shared with `run_js`; `"host"` is the host
+ * filesystem behind the engine's hook chain.
+ */
+export interface McpJsSessionBinding {
+	session?: string;
+	files?: "host" | "session";
 }
 
 const MODE_TYPE_MASK = 0o170000;
@@ -73,6 +115,17 @@ function toArrayBuffer(content: string | Uint8Array): ArrayBuffer {
 	return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
+/** The result of a stateless `run_js`, which answers with output inline. */
+function settledResult(answer: Record<string, unknown>): JavaScriptResult {
+	if (answer.output !== undefined && typeof answer.output !== "string") throw new Error("Invalid native output");
+	if (answer.error !== undefined && answer.error !== null && typeof answer.error !== "string")
+		throw new Error("Invalid native error");
+	return {
+		output: typeof answer.output === "string" ? answer.output : "",
+		error: typeof answer.error === "string" ? answer.error : undefined,
+	};
+}
+
 function nativeMessage(error: unknown): string {
 	if (error instanceof Error && error.message) return error.message;
 	const inner = (error as { inner?: { message?: unknown } } | null)?.inner;
@@ -81,28 +134,45 @@ function nativeMessage(error: unknown): string {
 }
 
 /**
- * Owns a native Engine created with createWithFilesystem. Do not share the Engine
- * with other callers. Guest heaps are stateless; hook-gated host files persist.
- * File operations are typed native calls that run through the engine's hook
- * chain; they never evaluate JavaScript or fall back to Node's filesystem.
- * Cancellation is checked before dispatch and after settlement, not mid-call;
- * native execution deadlines bound in-flight JavaScript, and cleanup waits for
- * all in-flight work to settle.
+ * Owns a native Engine. Do not share the Engine with other callers. File
+ * operations are typed native calls that run through the engine's hook chain;
+ * they never evaluate JavaScript or fall back to Node's filesystem. With a
+ * session binding, `run_js` and the file tools share the session's snapshot and
+ * the session's heap persists between runs. Cancellation cancels an in-flight
+ * execution on a stateful engine and is otherwise checked before dispatch and
+ * after settlement; cleanup waits for all in-flight work to settle.
  */
 export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 	readonly cwd: string;
+	readonly session: string | undefined;
+	readonly files: "host" | "session";
 	private readonly engine: McpJsNativeEngine;
+	private readonly view: McpJsNativeFsView;
 	private pending: Promise<void> = Promise.resolve();
 	private readonly inflight = new Set<Promise<unknown>>();
 	private closed = false;
 
-	constructor(engine: McpJsNativeEngine, cwd: string) {
+	constructor(engine: McpJsNativeEngine, cwd: string, binding: McpJsSessionBinding = {}) {
 		if (!posix.isAbsolute(cwd)) throw new Error("mcp-js cwd must be an absolute POSIX path");
 		if (!engine.hostFilesystemEnabled()) {
-			throw new Error("mcp-js engine has no filesystem configuration; create it with createWithFilesystem");
+			throw new Error("mcp-js engine has no filesystem configuration; set EngineConfig.filesystem");
+		}
+		if (binding.session !== undefined && binding.session.length === 0) {
+			throw new Error("mcp-js session name must not be empty");
+		}
+		const capabilities = engine.capabilities();
+		const files = binding.files ?? (binding.session !== undefined && capabilities.filesystem ? "session" : "host");
+		if (files === "session") {
+			if (binding.session === undefined) throw new Error("mcp-js session files require a session name");
+			if (!capabilities.filesystem) {
+				throw new Error("mcp-js session files require an engine with EngineConfig.fs_snapshot_store");
+			}
 		}
 		this.engine = engine;
 		this.cwd = posix.normalize(cwd);
+		this.session = binding.session;
+		this.files = files;
+		this.view = engine.fsView(files === "session" ? binding.session : undefined);
 	}
 
 	async runJavaScript(code: string, timeout: number | undefined, context: Context): Promise<JavaScriptResult> {
@@ -116,26 +186,55 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 				await this.engine.callToolAsync(
 					"run_js",
 					JSON.stringify({ code, execution_timeout_secs: timeout }),
-					undefined,
+					this.session,
 					undefined,
 				),
 			);
-			if (context.abortSignal?.aborted) throw new Error("Operation aborted after native execution settled");
 			if (!raw || typeof raw !== "object") throw new Error("Invalid native execution response");
-			const result = raw as Record<string, unknown>;
-			if (result.output !== undefined && typeof result.output !== "string") throw new Error("Invalid native output");
-			if (result.error !== undefined && result.error !== null && typeof result.error !== "string")
-				throw new Error("Invalid native error");
-			return {
-				output: typeof result.output === "string" ? result.output : "",
-				error: typeof result.error === "string" ? result.error : undefined,
-			};
+			const answer = raw as Record<string, unknown>;
+			const result =
+				typeof answer.execution_id === "string"
+					? await this.settleExecution(answer.execution_id, context)
+					: settledResult(answer);
+			if (context.abortSignal?.aborted) throw new Error("Operation aborted after native execution settled");
+			return result;
 		});
 		this.pending = operation.then(
 			() => undefined,
 			() => undefined,
 		);
 		return operation;
+	}
+
+	/**
+	 * A stateful engine answers `run_js` with an execution id. Wait for it,
+	 * cancelling the execution if the caller aborts meanwhile, then read the
+	 * console output. Cancellation does not roll back effects the execution
+	 * already had.
+	 */
+	private async settleExecution(executionId: string, context: Context): Promise<JavaScriptResult> {
+		const signal = context.abortSignal;
+		const cancel = () => {
+			try {
+				this.engine.cancelExecution(executionId);
+			} catch {
+				/* The execution may already have settled. */
+			}
+		};
+		if (signal?.aborted) cancel();
+		else signal?.addEventListener("abort", cancel, { once: true });
+		let info: McpJsNativeExecution;
+		try {
+			info = await this.engine.awaitExecution(executionId);
+		} finally {
+			signal?.removeEventListener("abort", cancel);
+		}
+		if (typeof info.status !== "string") throw new Error("Invalid native execution record");
+		const output = this.engine.getExecutionOutput(executionId, undefined, undefined, undefined, undefined).data;
+		if (typeof output !== "string") throw new Error("Invalid native output");
+		if (info.status === "completed") return { output, error: undefined };
+		const error = typeof info.error === "string" && info.error.length > 0 ? info.error : `execution ${info.status}`;
+		return { output, error };
 	}
 
 	private path(path: string): string {
@@ -170,7 +269,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 	}
 
 	private async info(absolute: string): Promise<FileInfo> {
-		const stat = await this.engine.fsLstat(absolute);
+		const stat = await this.view.lstat(absolute);
 		const type = stat.mode & MODE_TYPE_MASK;
 		const kind =
 			type === MODE_SYMLINK
@@ -197,7 +296,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		return this.file(this.cwd, context, async () => posix.join(...parts));
 	}
 	async readTextFile(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.file(path, context, () => this.engine.fsReadTextFile(this.path(path)));
+		return this.file(path, context, () => this.view.readTextFile(this.path(path)));
 	}
 	/**
 	 * Read lines through bounded native range reads, stopping once `maxLines` lines
@@ -220,7 +319,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 			for (;;) {
 				if (context.abortSignal?.aborted) throw new FileError("aborted", "Operation aborted", absolute);
 				const chunk = new Uint8Array(
-					await this.engine.fsReadFileRange(absolute, offset, BigInt(MCP_JS_LINE_READ_CHUNK_BYTES)),
+					await this.view.readFileRange(absolute, offset, BigInt(MCP_JS_LINE_READ_CHUNK_BYTES)),
 				);
 				const atEnd = chunk.byteLength < MCP_JS_LINE_READ_CHUNK_BYTES;
 				offset += BigInt(chunk.byteLength);
@@ -248,24 +347,24 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		});
 	}
 	async readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
-		return this.file(path, context, async () => new Uint8Array(await this.engine.fsReadFile(this.path(path))));
+		return this.file(path, context, async () => new Uint8Array(await this.view.readFile(this.path(path))));
 	}
 	async writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.file(path, context, async () => {
 			const absolute = this.path(path);
-			await this.engine.fsMakeDir(posix.dirname(absolute), true);
-			await this.engine.fsWriteFile(absolute, toArrayBuffer(content));
+			await this.view.makeDir(posix.dirname(absolute), true);
+			await this.view.writeFile(absolute, toArrayBuffer(content));
 		});
 	}
 	async appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
 		return this.file(path, context, async () => {
 			const absolute = this.path(path);
-			await this.engine.fsMakeDir(posix.dirname(absolute), true);
-			await this.engine.fsAppendFile(absolute, toArrayBuffer(content));
+			await this.view.makeDir(posix.dirname(absolute), true);
+			await this.view.appendFile(absolute, toArrayBuffer(content));
 		});
 	}
 	async renameFile(source: string, destination: string, context: Context): Promise<Result<void, FileError>> {
-		return this.file(source, context, () => this.engine.fsRename(this.path(source), this.path(destination)));
+		return this.file(source, context, () => this.view.rename(this.path(source), this.path(destination)));
 	}
 	async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
 		return this.file(path, context, () => this.info(this.path(path)));
@@ -273,7 +372,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 	async listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
 		return this.file(path, context, async () => {
 			const absolute = this.path(path);
-			const names = await this.engine.fsReadDir(absolute);
+			const names = await this.view.readDir(absolute);
 			const files: FileInfo[] = [];
 			for (const name of names) {
 				if (context.abortSignal?.aborted) throw new FileError("aborted", "Operation aborted", absolute);
@@ -283,17 +382,17 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		});
 	}
 	async canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.file(path, context, () => this.engine.fsCanonicalPath(this.path(path)));
+		return this.file(path, context, () => this.view.canonicalPath(this.path(path)));
 	}
 	async exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
-		return this.file(path, context, () => this.engine.fsExists(this.path(path)));
+		return this.file(path, context, () => this.view.exists(this.path(path)));
 	}
 	async createDir(
 		path: string,
 		options: { recursive?: boolean } | undefined,
 		context: Context,
 	): Promise<Result<void, FileError>> {
-		return this.file(path, context, () => this.engine.fsMakeDir(this.path(path), options?.recursive ?? true));
+		return this.file(path, context, () => this.view.makeDir(this.path(path), options?.recursive ?? true));
 	}
 	async remove(
 		path: string,
@@ -301,7 +400,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		context: Context,
 	): Promise<Result<void, FileError>> {
 		const result = await this.file(path, context, () =>
-			this.engine.fsRemove(this.path(path), options?.recursive ?? false),
+			this.view.remove(this.path(path), options?.recursive ?? false),
 		);
 		return !result.ok && options?.force && result.error.code === "not_found" ? ok(undefined) : result;
 	}
@@ -315,7 +414,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 			for (let attempt = 0; attempt < 8; attempt++) {
 				const candidate = posix.join(this.cwd, `${prefix ?? "tmp-"}${Math.random().toString(36).slice(2, 10)}`);
 				try {
-					await this.engine.fsMakeDir(candidate, false);
+					await this.view.makeDir(candidate, false);
 					return candidate;
 				} catch (cause) {
 					lastError = cause;
