@@ -6,6 +6,7 @@
  */
 
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { ServerError } from "@earendil-works/pi-client";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
 import { filterModels } from "../session-commands.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
@@ -38,6 +39,12 @@ export interface IrcBotOptions {
 
 function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/** The server answered that the Session does not exist (as opposed to failing to start it). */
+function isSessionGone(error: unknown): boolean {
+	if (error instanceof ServerError && error.code === "session_not_found") return true;
+	return /unknown session|session was not found/i.test(message(error));
 }
 
 export class IrcPiBot {
@@ -156,8 +163,11 @@ export class IrcPiBot {
 				try {
 					return await SessionLink.open(this.#options.target, record.sessionId);
 				} catch (error) {
+					// Only a Session the server no longer knows gets replaced; a worker
+					// or engine that is merely unavailable right now keeps its mapping.
+					if (!isSessionGone(error)) throw error;
 					this.#options.log(
-						`IRC: ${key}: session ${record.sessionId} unavailable (${message(error)}); creating a new one`,
+						`IRC: ${key}: session ${record.sessionId} is gone (${message(error)}); creating a new one`,
 					);
 					this.#store.delete(key);
 				}
