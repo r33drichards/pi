@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { channelWorkspace, createSendQueue } from "../src/irc/bot.ts";
 import { currentDomain, faultingDomain, installFaultDomains, runInDomain } from "../src/irc/fault-domain.ts";
+import { containFault } from "../src/irc/run.ts";
 
 const uninstallers: Array<() => void> = [];
 afterEach(() => {
@@ -96,6 +97,63 @@ describe("per-channel fault attribution", () => {
 		expect(globalThis.setTimeout).not.toBe(before);
 		uninstall();
 		expect(globalThis.setTimeout).toBe(before);
+	});
+});
+
+describe("a throwing extension timer", () => {
+	it("is reported against its own channel, and the other channels keep working", async () => {
+		install();
+		const reported: Array<{ channel: string; error: string }> = [];
+		const logged: string[] = [];
+		const bot = {
+			onChannelFault: (channel: string, error: unknown) => {
+				reported.push({ channel, error: error instanceof Error ? error.message : String(error) });
+			},
+		};
+		// Exactly what `runIrc` installs on the process.
+		const contain = containFault("exception", bot, (line) => logged.push(line));
+
+		let betaRan = false;
+		// #alpha's extension arms a timer that throws against a stale context.
+		runInDomain("#alpha", () => {
+			setTimeout(() => {
+				try {
+					throw new Error("pi-faulty-timer: deliberate fault from a background timer");
+				} catch (error) {
+					// The throw reaches the process the way an uncaught one does.
+					contain(error);
+				}
+			}, 1);
+		});
+		// #beta is doing its own work at the same time and must be untouched.
+		runInDomain("#beta", () => {
+			setTimeout(() => {
+				betaRan = true;
+			}, 2);
+		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
+
+		expect(reported).toEqual([
+			{ channel: "#alpha", error: "pi-faulty-timer: deliberate fault from a background timer" },
+		]);
+		expect(betaRan).toBe(true);
+		// Nothing went unattributed, and the process is still here to assert it.
+		expect(logged).toEqual([]);
+		// The channel is forgotten once handled, so the next fault is attributed fresh.
+		expect(faultingDomain()).toBeUndefined();
+	});
+
+	it("falls back to a plain log when the failure belongs to no channel", () => {
+		install();
+		const reported: string[] = [];
+		const logged: string[] = [];
+		const contain = containFault("rejection", { onChannelFault: (channel) => reported.push(channel) }, (line) =>
+			logged.push(line),
+		);
+		contain(new Error("something outside a channel"));
+		expect(reported).toEqual([]);
+		expect(logged).toHaveLength(1);
+		expect(logged[0]).toContain("outside any channel");
 	});
 });
 

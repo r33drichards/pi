@@ -80,6 +80,30 @@ export function resolveEngine(cwd: string, agentDir: string): EngineForkOptions 
 	return { url: settings.url, ...(settings.headers === undefined ? {} : { headers: settings.headers }) };
 }
 
+/**
+ * The process-level handler that keeps an extension's background failure from
+ * ending the bot. A timer armed by a channel's work carries that channel, so
+ * the failure is reported against it and every other channel keeps running.
+ * Nothing is swallowed on the way: the domain only records who was running.
+ */
+export function containFault(
+	kind: string,
+	bot: Pick<IrcPiBot, "onChannelFault">,
+	log: (line: string) => void,
+): (error: unknown) => void {
+	return (error: unknown) => {
+		const channel = faultingDomain();
+		clearFaultingDomain();
+		if (channel !== undefined) {
+			bot.onChannelFault(channel, error);
+			return;
+		}
+		log(
+			`IRC: uncaught ${kind} outside any channel (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+		);
+	};
+}
+
 export interface RunIrcOptions {
 	log?: (line: string) => void;
 	stop?: Promise<void>;
@@ -150,19 +174,8 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 	// A timer an extension started keeps the channel that created it, so a
 	// failure names its channel instead of just ending the process.
 	const uninstallDomains = installFaultDomains();
-	const onFault = (kind: string) => (error: unknown) => {
-		const channel = faultingDomain();
-		clearFaultingDomain();
-		if (channel !== undefined) {
-			bot.onChannelFault(channel, error);
-			return;
-		}
-		log(
-			`IRC: uncaught ${kind} outside any channel (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
-		);
-	};
-	const onUncaught = onFault("exception");
-	const onRejection = onFault("rejection");
+	const onUncaught = containFault("exception", bot, log);
+	const onRejection = containFault("rejection", bot, log);
 	process.on("uncaughtException", onUncaught);
 	process.on("unhandledRejection", onRejection);
 	try {
