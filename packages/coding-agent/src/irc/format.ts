@@ -53,6 +53,15 @@ export function describeToolResult(name: string, text: string, isError: boolean)
 	return lines <= 1 ? `[${name}] → ${line || "(no output)"}` : `[${name}] → ${line} (+${lines - 1} lines)`;
 }
 
+/**
+ * The one-time note a freshly forked session sees. A fork inherits the whole
+ * conversation, so without this it keeps answering as if it were still in the
+ * channel it came from.
+ */
+export function forkNotice(channel: string, parent: string): string {
+	return `[you are now in ${channel}, forked from ${parent}. Reply in ${channel} only. Do not post to ${parent} or any other channel unless the user asks you to by name.]`;
+}
+
 /** The prompt text the model sees for an IRC line, after pirc-extension. */
 export function framePrompt(channel: string, nick: string, text: string): string {
 	return `[IRC ${channel}] <${nick}> ${text}`;

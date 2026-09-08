@@ -1,18 +1,29 @@
 /**
- * `pi irc`: the foreground experimental server plus the IRC presentation.
- * Configuration comes from flags, then IRC_* environment variables.
+ * `pi irc`: connect the agent to an IRC network, one session per channel.
+ * Configuration comes from flags, then `IRC_*` environment variables.
  */
 
 import { join } from "node:path";
-import type { IrcCommand } from "../../cli/experimental/commands/irc.ts";
-import { getAgentDir } from "../../config.ts";
-import { SettingsManager } from "../../core/settings-manager.ts";
-import type { RunningServer, startForegroundServer } from "../server.ts";
+import { getAgentDir } from "../config.ts";
+import { ModelRuntime } from "../core/model-runtime.ts";
+import { DefaultResourceLoader } from "../core/resource-loader.ts";
+import { SettingsManager } from "../core/settings-manager.ts";
 import { type IrcBotOptions, IrcPiBot } from "./bot.ts";
-import { CONTROL_TOKEN_ENV, CONTROL_URL_ENV, type ControlServer, startControlServer } from "./control.ts";
 import { type EngineForkOptions, engineCapabilities } from "./engine-fork.ts";
 
-export type StartServer = typeof startForegroundServer;
+export interface IrcCommand {
+	readonly server?: string;
+	readonly port?: number;
+	readonly tls?: boolean;
+	readonly nick?: string;
+	readonly password?: string;
+	readonly channels?: readonly string[];
+	readonly controlChannel?: string;
+	readonly all?: boolean;
+	readonly stateDir?: string;
+	readonly sessionDir?: string;
+	readonly cwd?: string;
+}
 
 export interface ResolvedIrcConfig {
 	server: string;
@@ -59,9 +70,9 @@ export function resolveIrcConfig(command: IrcCommand, env: NodeJS.ProcessEnv, ag
 	};
 }
 
-/** The mcp-js coordinator this server's sessions use, so `,fork` can carry engine state. */
-export function resolveEngineFork(cwd: string): EngineForkOptions | undefined {
-	const settings = SettingsManager.create(cwd).getMcpJs();
+/** The mcp-js coordinator every channel's sandbox runs on. */
+export function resolveEngine(cwd: string, agentDir: string): EngineForkOptions | undefined {
+	const settings = SettingsManager.create(cwd, agentDir).getMcpJs();
 	if (settings?.mode !== "coordinator" || !settings.url) return undefined;
 	return { url: settings.url, ...(settings.headers === undefined ? {} : { headers: settings.headers }) };
 }
@@ -72,56 +83,62 @@ export interface RunIrcOptions {
 	env?: NodeJS.ProcessEnv;
 }
 
-export async function runIrcPresentation(
-	command: IrcCommand,
-	startServer: StartServer,
-	options: RunIrcOptions = {},
-): Promise<void> {
+export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): Promise<void> {
 	const log = options.log ?? ((line: string) => console.log(line));
 	const env = options.env ?? process.env;
-	const config = resolveIrcConfig(command, env, getAgentDir());
-	// The control surface must exist before the server so every session worker
-	// inherits its address and token and registers the delegation tools.
-	let control: ControlServer | undefined;
-	const handlers: { current: IrcPiBot | undefined } = { current: undefined };
-	control = await startControlServer({
-		spawn: (request) => handlers.current!.spawn(request),
-		send: (request) => handlers.current!.send(request),
-		merge: (request) => handlers.current!.merge(request),
-	});
-	process.env[CONTROL_URL_ENV] = control.url;
-	process.env[CONTROL_TOKEN_ENV] = control.token;
-	const server: RunningServer = await startServer({
-		serverId: command.serverId,
-		sessionDir: command.sessionDir,
-		provider: command.provider,
-		model: command.model,
-		pluginPackages: command.pluginPackages ?? [],
-	});
-	log(`Server: ${server.serverId}`);
-	log(`Socket: ${server.socketPath}`);
-	let bot: IrcPiBot | undefined;
-	try {
-		const engineFork = resolveEngineFork(process.cwd());
-		let engineHeap = false;
-		if (engineFork) {
-			try {
-				engineHeap = (await engineCapabilities(engineFork)).heap;
-			} catch (error) {
-				log(
-					`IRC: could not read engine capabilities from ${engineFork.url}: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
+	const agentDir = getAgentDir();
+	const cwd = command.cwd ?? process.cwd();
+	const config = resolveIrcConfig(command, env, agentDir);
+	const sessionDir = command.sessionDir ?? env.PI_IRC_SESSION_DIR ?? join(agentDir, "irc", "sessions");
+
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+	await resourceLoader.reload();
+	const extensions = resourceLoader.getExtensions();
+	if (extensions.extensions.length > 0) {
+		log(`Extensions: ${extensions.extensions.length} loaded`);
+	}
+	for (const failure of extensions.errors) log(`Extension failed: ${failure.path}: ${failure.error}`);
+	const modelRuntime = await ModelRuntime.create();
+
+	const engineFork = resolveEngine(cwd, agentDir);
+	let engineHeap = false;
+	if (engineFork) {
+		try {
+			engineHeap = (await engineCapabilities(engineFork)).heap;
+			log(`Engine: ${engineFork.url} (heap ${engineHeap ? "on" : "off"})`);
+		} catch (error) {
+			log(
+				`IRC: could not read engine capabilities from ${engineFork.url}: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
-		const botOptions: IrcBotOptions = {
-			...config,
-			target: { serverId: server.serverId, socketPath: server.socketPath },
-			...(engineFork === undefined ? {} : { engineFork, engineHeap }),
-			log,
-		};
-		bot = new IrcPiBot(botOptions);
-		handlers.current = bot;
-		log(`Control: ${control.url} (delegation tools enabled for session workers)`);
+	} else {
+		log("Engine: none configured (mcpJs coordinator); channels get no sandbox tools");
+	}
+
+	const guestNetwork = envFlag(env.PI_IRC_GUEST_NETWORK);
+	const guestModules = envFlag(env.PI_IRC_GUEST_MODULES);
+	const botOptions: IrcBotOptions = {
+		...config,
+		cwd,
+		agentDir,
+		sessionDir,
+		settingsManager,
+		resourceLoader,
+		modelRuntime,
+		...(engineFork === undefined ? {} : { engineFork, engineHeap }),
+		...(guestNetwork === undefined && guestModules === undefined
+			? {}
+			: {
+					guest: {
+						...(guestNetwork === undefined ? {} : { network: guestNetwork }),
+						...(guestModules === undefined ? {} : { modules: guestModules }),
+					},
+				}),
+		log,
+	};
+	const bot = new IrcPiBot(botOptions);
+	try {
 		log(
 			`IRC: connecting to ${config.server}:${config.port}${config.tls ? " (tls)" : ""} as ${config.nick}, control ${config.controlChannel}`,
 		);
@@ -141,12 +158,9 @@ export async function runIrcPresentation(
 			};
 			process.once("SIGINT", finish);
 			process.once("SIGTERM", finish);
-			void server.closed.then(finish, fail);
 			void options.stop?.then(finish, fail);
 		});
 	} finally {
-		await bot?.close();
-		await server.close();
-		await control?.close();
+		await bot.close();
 	}
 }

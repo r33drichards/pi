@@ -2,13 +2,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { mentionText, parseChannelList, parseCommand } from "../src/experimental/irc/commands.ts";
-import { forkEngineSession } from "../src/experimental/irc/engine-fork.ts";
-import { describeToolCall, describeToolResult, framePrompt, toIrcLines } from "../src/experimental/irc/format.ts";
-import { forkChannelName, petname } from "../src/experimental/irc/petname.ts";
-import { resolveIrcConfig } from "../src/experimental/irc/run.ts";
-import { ChannelSessionStore } from "../src/experimental/irc/state.ts";
-import { filterModels } from "../src/experimental/session-commands.ts";
+import { IrcCommandError, parseIrcCommand } from "../src/irc/cli.ts";
+import { mentionText, parseChannelList, parseCommand } from "../src/irc/commands.ts";
+import { forkEngineSession } from "../src/irc/engine-fork.ts";
+import { describeToolCall, describeToolResult, framePrompt, toIrcLines } from "../src/irc/format.ts";
+import { forkChannelName, petname } from "../src/irc/petname.ts";
+import { resolveIrcConfig } from "../src/irc/run.ts";
+import { filterModels } from "../src/irc/session-commands.ts";
+import { ChannelSessionStore } from "../src/irc/state.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "pi-irc-test-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -225,7 +226,7 @@ describe("irc config resolution", () => {
 			IRC_CHANNELS: "#a,#b",
 			IRC_NICK: "envpi",
 		};
-		const fromEnv = resolveIrcConfig({ command: "irc" }, env, "/agent");
+		const fromEnv = resolveIrcConfig({}, env, "/agent");
 		expect(fromEnv).toMatchObject({
 			server: "irc.env",
 			port: 6697,
@@ -237,13 +238,53 @@ describe("irc config resolution", () => {
 		expect(fromEnv.channels).toEqual(["#pi", "#a", "#b"]);
 		expect(fromEnv.statePath).toBe("/agent/irc/channels.json");
 		const fromFlags = resolveIrcConfig(
-			{ command: "irc", server: "irc.flag", channels: ["#Z"], all: true, controlChannel: "#Ops" },
+			{ server: "irc.flag", channels: ["#Z"], all: true, controlChannel: "#Ops" },
 			env,
 			"/agent",
 		);
 		expect(fromFlags).toMatchObject({ server: "irc.flag", port: 6697, controlChannel: "#ops", addressedOnly: false });
 		expect(fromFlags.channels).toEqual(["#ops", "#z"]);
-		expect(resolveIrcConfig({ command: "irc", server: "x" }, {}, "/agent").port).toBe(6667);
-		expect(() => resolveIrcConfig({ command: "irc" }, {}, "/agent")).toThrow("IRC_SERVER");
+		expect(resolveIrcConfig({ server: "x" }, {}, "/agent").port).toBe(6667);
+		expect(() => resolveIrcConfig({}, {}, "/agent")).toThrow("IRC_SERVER");
+	});
+});
+
+describe("pi irc command line", () => {
+	it("only claims the irc subcommand", () => {
+		expect(parseIrcCommand([])).toBeUndefined();
+		expect(parseIrcCommand(["--print", "hello"])).toBeUndefined();
+		expect(parseIrcCommand(["irc"])).toEqual({});
+	});
+
+	it("parses the connection options", () => {
+		expect(
+			parseIrcCommand([
+				"irc",
+				"--server",
+				"irc.example",
+				"--port",
+				"6697",
+				"--tls",
+				"--nick",
+				"pi",
+				"--channels",
+				"#pi,#dev",
+				"--all",
+			]),
+		).toEqual({
+			server: "irc.example",
+			port: 6697,
+			tls: true,
+			nick: "pi",
+			channels: ["#pi", "#dev"],
+			all: true,
+		});
+		expect(parseIrcCommand(["irc", "--help"])).toEqual({ help: true });
+	});
+
+	it("rejects bad values and unknown flags", () => {
+		expect(() => parseIrcCommand(["irc", "--port", "http"])).toThrow(IrcCommandError);
+		expect(() => parseIrcCommand(["irc", "--server"])).toThrow("--server requires a value");
+		expect(() => parseIrcCommand(["irc", "--web-port", "8600"])).toThrow("Unknown option --web-port");
 	});
 });

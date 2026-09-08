@@ -1,14 +1,26 @@
-# IRC presentation on the experimental server (`pi irc`)
+# IRC (`pi irc`)
 
-Date: 2026-09-07. Status: implemented under `packages/coding-agent/src/experimental/irc/`.
+Implemented under `packages/coding-agent/src/irc/`.
 
-`pi irc` runs the experimental server in-process and joins an IRC network as a
-bot. Every channel it is in (and every DM peer) has its own Session, and the
-sessions are whatever the server's settings select: started from a directory
-whose `mcpJs` setting names a coordinator, each channel is an mcp-js sandbox
-with `read`, `write`, and `run_js` on its own empty filesystem snapshot.
+`pi irc` joins an IRC network as a bot. Every channel it is in (and every DM
+peer) has its own agent session, running in this process on the same
+`AgentSession` runtime as interactive mode — so **installed pi extensions
+load and work**. When the `mcpJs` setting names a coordinator, each channel's
+`read`, `write`, and `run_js` act on that channel's own mcp-js filesystem
+snapshot instead of the host, and pi's host file tools are switched off.
 
-    PI_EXPERIMENTAL=1 ./pi-test.sh irc --server irc.example --port 6667 --nick pi
+    pi irc --server irc.example --port 6667 --nick pi
+
+## Extensions
+
+Sessions load whatever is installed for the agent directory, so
+
+    pi install npm:pi-schedule-prompt
+
+gives every channel the extension's tools; a scheduled prompt fires into the
+channel it was scheduled from. Extensions that register slash commands or
+message renderers load without error, but those surfaces are inert here: the
+bot has no TUI. `,reload` reloads them.
 
 ## Talking to it
 
@@ -91,19 +103,35 @@ Flags win over environment variables:
 | `--control-channel` | `IRC_CONTROL_CHANNEL` | `#pi` |
 | `--all` | `IRC_RESPOND_TO_ALL` | off |
 | `--state-dir` | `PI_IRC_STATE_DIR` | `<agentDir>/irc` |
-| | `PI_IRC_CONTROL_URL`, `PI_IRC_CONTROL_TOKEN` | set by `pi irc` for its workers; do not set by hand |
+| `--session-dir` | `PI_IRC_SESSION_DIR` | `<agentDir>/irc/sessions` |
+| | `PI_IRC_GUEST_NETWORK`, `PI_IRC_GUEST_MODULES` | what the sandbox may reach, for the `run_js` description |
+
+The sandbox itself comes from the `mcpJs` coordinator setting; see
+[settings.md](settings.md).
 
 
 ## How it is built
 
-- `session-link.ts`: one client connection per channel (a connection holds
-  one attachment), the built-in services, and a prompt driver that relays
-  `message_end` and `tool_start`/`tool_end` events from the Transcript state.
-- `bot.ts`: irc-framework client, message routing, control commands, a
-  per-target send queue with spacing to stay under flood limits.
-- `SessionManagement.fork` is new on the server: `repo.fork` with tree scope,
-  exposed through the same client wrapper the TUI uses.
+- `channel-session.ts`: one `AgentSession` per channel. It builds the
+  channel's session file, its mcp-js sandbox (named after the pi session id so
+  forks can carry engine state), its tools, and calls `bindExtensions()` —
+  which every host must do, because extensions initialize on the
+  `session_start` it emits. It relays `message_end` and
+  `tool_execution_start`/`_end` to the channel, so anything that prompts a
+  session (a channel line, a spawned parent, a scheduled prompt) shows up.
+- `tools.ts`: `read`/`write`/`run_js` over the channel's sandbox, replacing
+  pi's host file tools (`noTools: "builtin"` keeps extension tools enabled),
+  plus `spawn_channel`/`irc_send`/`merge_channel` closing over the bot.
+- `bot.ts`: irc-framework client, message routing, commands, and a per-target
+  send queue with spacing to stay under flood limits.
+- `engine-fork.ts`: carries mcp-js filesystem state across `,fork` and merges
+  it back for `,merge`, over the coordinator's HTTP API.
 
-Tests: `test/experimental-irc.test.ts` (commands, formatting, store, engine
-fork over a fake coordinator, config) and the fork case in
-`test/experimental-remote-runtime.test.ts`.
+A fork inherits the parent's conversation, so it is told where it now lives
+and `irc_send` refuses to post back to the parent unless the user asked for
+that channel by name.
+
+Tests: `test/irc.test.ts` (commands, mentions, formatting, petnames, store,
+engine fork over a fake coordinator, config, CLI parsing) and
+`test/irc-delegation.test.ts` (engine fork/merge, delegation tools, the
+fork-reply policy).
