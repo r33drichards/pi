@@ -73,6 +73,28 @@ describe("tracker: intent", () => {
 		expect(t.flush()).toEqual([["d", ["a"]]]);
 	});
 
+	it("treats undefined properties inside assigned objects as absent", () => {
+		type Tool = { result?: { content: string[]; details?: { truncated?: boolean } }; customInput?: string };
+		type State = { tool: Tool | null; pad: string };
+		const t = track<State>({ tool: null, pad: PAD });
+		let replica = apply<State>(undefined, t.flush());
+		// A whole-object set must not carry undefined into the ops.
+		t.state.tool = { customInput: undefined, result: { content: [], details: undefined } };
+		let ops = t.flush();
+		expect(JSON.parse(JSON.stringify(ops))).toStrictEqual(ops);
+		replica = apply(replica, ops);
+		expect(replica.tool).toEqual({ result: { content: [] } });
+		expect(Object.hasOwn(replica.tool!, "customInput")).toBe(false);
+		// A diff into an object with undefined properties must delete or skip them, never set undefined.
+		t.state.tool = { customInput: "x", result: { content: ["a"], details: { truncated: true } } };
+		replica = apply(replica, t.flush());
+		t.state.tool = { customInput: undefined, result: { content: ["a"], details: { truncated: undefined } } };
+		ops = t.flush();
+		expect(JSON.parse(JSON.stringify(ops))).toStrictEqual(ops);
+		replica = apply(replica, ops);
+		expect(replica.tool).toEqual({ result: { content: ["a"], details: {} } });
+	});
+
 	it("uses absence and delete for optional object properties", () => {
 		type Settings = { something?: string; foo: number };
 		const t = track<Settings>({ foo: 1 });
