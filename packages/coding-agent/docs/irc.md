@@ -17,10 +17,11 @@ Sessions load whatever is installed for the agent directory, so
 
     pi install npm:pi-schedule-prompt
 
-gives every channel the extension's tools; a scheduled prompt fires into the
-channel it was scheduled from. Extensions that register slash commands or
-message renderers load without error, but those surfaces are inert here: the
-bot has no TUI. `,reload` reloads them.
+gives every channel the extension's tools. Extensions that register slash
+commands or message renderers load without error, but those surfaces are inert
+here: the bot has no TUI. `,reload` reloads them. Output an extension produces
+on its own, such as a scheduled prompt's answer, reaches the channel only in a
+single-channel bot; see [One session per process](#one-session-per-process).
 
 ## Talking to it
 
@@ -131,7 +132,40 @@ A fork inherits the parent's conversation, so it is told where it now lives
 and `irc_send` refuses to post back to the parent unless the user asked for
 that channel by name.
 
+## One session per process
+
+pi's session runtime expects a single `AgentSession` per process, and this bot
+runs one per channel. Two consequences, both measured against a live network:
+
+- **Extension-driven turns only reach IRC when one channel is open.** With a
+  single channel, a `pi-schedule-prompt` job fires, the model answers, and the
+  answer appears in the channel. Open a second channel — no faults, nothing
+  else changed — and the job still executes (the engine logs `Executing
+  scheduled prompt` and the job records `runCount: 1, lastStatus: success`),
+  but its answer never reaches the channel. Prompts typed by a person keep
+  working either way.
+- **A background timer in one channel's extension can throw against a context
+  it captured earlier**, which reaches the process as an uncaught exception
+  with nothing to say where it came from. Timers started by a channel's work
+  now carry that channel, so such a failure is named and the process survives
+  instead of exiting. Disposing or restarting the offending session is *not*
+  the answer: `AgentSession.dispose()` invalidates the extension runtime the
+  whole process shares, which silently stops every other channel. That is also
+  why `,part` leaves the session in memory.
+
+The fix for both is one process per channel, matching what the runtime
+assumes. Until then, treat extension-driven output as reliable only in a
+single-channel deployment.
+
+- `fault-domain.ts`: names the channel a background failure came from, by
+  running each channel's work in an `AsyncLocalStorage` domain that patched
+  timers carry into their callbacks. It records who was running and nothing
+  else — a callback is never wrapped in try/catch, because swallowing a throw
+  the runtime expects to propagate leaves a promise unsettled and hangs the
+  session.
+
 Tests: `test/irc.test.ts` (commands, mentions, formatting, petnames, store,
-engine fork over a fake coordinator, config, CLI parsing) and
+engine fork over a fake coordinator, config, CLI parsing),
 `test/irc-delegation.test.ts` (engine fork/merge, delegation tools, the
-fork-reply policy).
+fork-reply policy), and `test/irc-resilience.test.ts` (fault attribution, and
+regressions for the per-channel workspace and the send queue).

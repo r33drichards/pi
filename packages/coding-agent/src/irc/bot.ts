@@ -61,6 +61,50 @@ function message(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** A faulting extension usually faults on a timer, so its noise is capped. */
+const FAULT_WINDOW_MS = 60_000;
+const MAX_REPORTED_FAULTS = 3;
+
+/**
+ * A channel's working directory. Extensions keep project-local state under
+ * `cwd`, so channels must not share one: pi-schedule-prompt otherwise writes
+ * every channel's jobs into whichever channel started first.
+ */
+export function channelWorkspace(root: string, channel: string): string {
+	const safe = channel.replace(/^[#&]/, "").replace(/[^a-z0-9._-]/gi, "_") || "default";
+	return join(root, safe);
+}
+
+/**
+ * Send lines to one target, one after another, spaced out to stay under flood
+ * limits. The returned function chains, and a line that fails to send is
+ * reported and skipped: the chain must never reject, or every later line to
+ * that target would be dropped silently.
+ */
+export function createSendQueue(
+	send: (line: string) => void,
+	spacing: number,
+	onError: (error: unknown) => void,
+	stopped: () => boolean = () => false,
+): (lines: string[]) => Promise<void> {
+	let queue: Promise<void> = Promise.resolve();
+	return (lines: string[]) => {
+		const next = queue.then(async () => {
+			for (const line of lines) {
+				if (stopped()) return;
+				try {
+					send(line);
+				} catch (error) {
+					onError(error);
+				}
+				if (spacing > 0) await new Promise((resolve) => setTimeout(resolve, spacing));
+			}
+		});
+		queue = next.catch(() => {});
+		return queue;
+	};
+}
+
 /**
  * Whether a prompt explicitly asks for another channel, which is what lets a
  * forked session post outside its own channel. Naming the channel is the
@@ -79,11 +123,13 @@ export class IrcPiBot implements ChannelDelegate {
 	readonly #store: ChannelSessionStore;
 	readonly #sessions = new Map<string, ChannelSession>();
 	readonly #opening = new Map<string, Promise<ChannelSession>>();
-	readonly #sendQueues = new Map<string, Promise<void>>();
+	readonly #sendQueues = new Map<string, (lines: string[]) => Promise<void>>();
 	/** Channels whose next prompt carries the "you are in X" fork notice. */
 	readonly #pendingNotice = new Map<string, string>();
 	/** The last prompt text a channel received, for the irc_send policy. */
 	readonly #lastPrompt = new Map<string, string>();
+	/** Recent extension faults per channel, to keep the log readable. */
+	readonly #faults = new Map<string, number[]>();
 	#nick: string;
 	#closed = false;
 
@@ -108,8 +154,7 @@ export class IrcPiBot implements ChannelDelegate {
 	 * sharing a directory would race over each other's files.
 	 */
 	#cwdFor(channel: string): string {
-		const safe = channel.replace(/^[#&]/, "").replace(/[^a-z0-9._-]/gi, "_") || "default";
-		const dir = join(this.#options.workspaceRoot, safe);
+		const dir = channelWorkspace(this.#options.workspaceRoot, channel);
 		mkdirSync(dir, { recursive: true });
 		return dir;
 	}
@@ -181,25 +226,17 @@ export class IrcPiBot implements ChannelDelegate {
 	/** Send lines to a target with spacing, so a long reply does not trip flood limits. */
 	say(target: string, text: string | string[]): void {
 		const lines = Array.isArray(text) ? text : [text];
-		const spacing = this.#options.sendSpacingMs ?? 350;
-		const previous = this.#sendQueues.get(target) ?? Promise.resolve();
-		const next = previous.then(async () => {
-			for (const line of lines) {
-				if (this.#closed) return;
-				try {
-					this.#irc.say(target, line);
-				} catch (error) {
-					// One failed line must not silence the channel: the queue is
-					// chained, so a rejection here would skip every later send.
-					this.#options.log(`IRC: send to ${target} failed: ${message(error)}`);
-				}
-				await new Promise((resolve) => setTimeout(resolve, spacing));
-			}
-		});
-		this.#sendQueues.set(
-			target,
-			next.catch(() => {}),
-		);
+		let queue = this.#sendQueues.get(target);
+		if (!queue) {
+			queue = createSendQueue(
+				(line) => this.#irc.say(target, line),
+				this.#options.sendSpacingMs ?? 350,
+				(error) => this.#options.log(`IRC: send to ${target} failed: ${message(error)}`),
+				() => this.#closed,
+			);
+			this.#sendQueues.set(target, queue);
+		}
+		void queue(lines);
 	}
 
 	/** The relay that puts a channel's session activity into that channel. */
@@ -208,6 +245,31 @@ export class IrcPiBot implements ChannelDelegate {
 			text: (lines: string[]) => this.say(channel, lines),
 			tool: (line: string) => this.say(channel, line),
 		};
+	}
+
+	/**
+	 * An extension in `channel` threw from something it scheduled earlier.
+	 * Only that channel is affected: its session is dropped and rebuilt, which
+	 * gives the extension a fresh context, and every other channel keeps
+	 * running untouched.
+	 */
+	onChannelFault(channel: string, error: unknown): void {
+		const key = channel.toLowerCase();
+		const seen = this.#faults.get(key) ?? [];
+		const recent = [...seen, Date.now()].filter((at) => Date.now() - at < FAULT_WINDOW_MS);
+		this.#faults.set(key, recent);
+		// Report the first few and then go quiet: a widget that refreshes on a
+		// timer faults on every tick, and the log is not the place for that.
+		if (recent.length <= MAX_REPORTED_FAULTS) {
+			this.#options.log(`IRC: ${key}: extension fault contained: ${message(error)}`);
+			if (recent.length === MAX_REPORTED_FAULTS) {
+				this.#options.log(`IRC: ${key}: further extension faults in this channel will not be logged`);
+			}
+		}
+		// The session is deliberately left alone. Disposing it would invalidate
+		// the extension runtime this process shares between channels, which
+		// silently stops the others: pi's session runtime expects one session
+		// per process. Containing the throw is what keeps the rest working.
 	}
 
 	/** Open (or reuse) a channel's session, creating it on first use. */
@@ -402,9 +464,8 @@ export class IrcPiBot implements ChannelDelegate {
 			return;
 		}
 		if (command.kind === "part") {
-			const session = this.#sessions.get(command.channel);
-			this.#sessions.delete(command.channel);
-			await session?.close();
+			// The session stays open in memory: closing it would invalidate the
+			// extension runtime shared with every other channel.
 			this.#irc.part(command.channel, "session kept; ,join to resume");
 			this.say(room, `left ${command.channel}; its session is kept`);
 			return;
