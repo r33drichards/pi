@@ -71,6 +71,7 @@ export {
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
 export * from "./harness/context.ts";
+export type { JavaScriptResult, JavaScriptRuntime, JavaScriptToolContext } from "./harness/env/javascript.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/prompt-templates.ts";
 export * from "./harness/result.ts";

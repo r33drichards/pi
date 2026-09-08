@@ -12,7 +12,7 @@ import {
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToolPath } from "./path-utils.ts";
-import type { ExecutionToolContext } from "./tool-context.ts";
+import type { FileToolContext } from "./tool-context.ts";
 
 const replaceEditSchema = Type.Object(
 	{
@@ -87,7 +87,7 @@ function editAccessError(path: string, error: FileError): Error {
 	return new Error(`Could not edit file: ${path}. Error code: ${error.code}.`, { cause: error });
 }
 
-export function createEditTool<TContext extends ExecutionToolContext = ExecutionToolContext>(): AgentHarnessTool<
+export function createEditTool<TContext extends FileToolContext = FileToolContext>(): AgentHarnessTool<
 	TContext,
 	typeof editSchema,
 	EditToolDetails | undefined

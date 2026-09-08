@@ -19,5 +19,6 @@ export {
 	type ReadToolInput,
 	type ReadToolOptions,
 } from "./read.ts";
-export type { ExecutionToolContext } from "./tool-context.ts";
+export { createRunJsTool, type RunJsToolInput } from "./run-js.ts";
+export type { ExecutionToolContext, FileToolContext } from "./tool-context.ts";
 export { createWriteTool, type WriteToolInput } from "./write.ts";

@@ -1,6 +1,11 @@
-import type { ExecutionEnv } from "../types.ts";
+import type { ExecutionEnv, FileSystem } from "../types.ts";
 
-/** Filesystem and shell context required by the built-in execution tools. */
-export interface ExecutionToolContext {
+/** Filesystem context shared by local and JavaScript-backed tools. */
+export interface FileToolContext {
+	env: FileSystem;
+}
+
+/** Filesystem and shell context required by bash. */
+export interface ExecutionToolContext extends FileToolContext {
 	env: ExecutionEnv;
 }

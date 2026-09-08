@@ -1,5 +1,5 @@
 import type { Context } from "../context.ts";
-import type { ExecutionEnv } from "../types.ts";
+import type { FileSystem } from "../types.ts";
 import { getOrThrow } from "../types.ts";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -10,11 +10,11 @@ function normalizeToolPath(path: string): string {
 	return normalized.startsWith("@") ? normalized.slice(1) : normalized;
 }
 
-export async function resolveToolPath(env: ExecutionEnv, path: string, context: Context): Promise<string> {
+export async function resolveToolPath(env: FileSystem, path: string, context: Context): Promise<string> {
 	return getOrThrow(await env.absolutePath(normalizeToolPath(path), context));
 }
 
-export async function resolveReadToolPath(env: ExecutionEnv, path: string, context: Context): Promise<string> {
+export async function resolveReadToolPath(env: FileSystem, path: string, context: Context): Promise<string> {
 	const resolved = await resolveToolPath(env, path, context);
 	const variants = [
 		resolved,
