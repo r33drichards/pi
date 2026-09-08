@@ -38,6 +38,7 @@ import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
+import { createIrcTools, ircToolsFromEnv } from "./irc/tools.ts";
 import { createMcpJsEnvironmentFactory } from "./mcp-js-env.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
@@ -922,6 +923,9 @@ export async function createCodingAgentHarness(
 	}
 	if (!resolved.model) throw new Error("Session worker could not resolve a model");
 	const tools = createSessionWorkerTools(executionEnv);
+	// Under `pi irc`, workers also get the delegation tools that talk back to the presentation.
+	const ircTools = ircToolsFromEnv(session.metadata.id);
+	if (ircTools) tools.push(...createIrcTools<{ env: SessionWorkerExecutionEnv }>(ircTools));
 	const activeToolNames = tools.map((tool) => tool.name);
 	const harness = (
 		await AgentHarness.create(

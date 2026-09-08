@@ -10,7 +10,8 @@ import { ServerError } from "@earendil-works/pi-client";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
 import { filterModels } from "../session-commands.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
-import { type EngineForkOptions, forkEngineSession } from "./engine-fork.ts";
+import type { ControlHandlers, MergeRequest, MergeResult, SendRequest, SpawnRequest, SpawnResult } from "./control.ts";
+import { type EngineForkOptions, forkEngineSession, type MergeStrategy, mergeEngineSessions } from "./engine-fork.ts";
 import { framePrompt } from "./format.ts";
 import { forkChannelName } from "./petname.ts";
 import { SessionLink, type SessionLinkTarget } from "./session-link.ts";
@@ -29,8 +30,12 @@ export interface IrcBotOptions {
 	addressedOnly: boolean;
 	statePath: string;
 	target: SessionLinkTarget;
-	/** When set, `,fork` also carries the mcp-js heap and filesystem across. */
+	/** When set, `,fork` also carries the mcp-js filesystem (and heap, if persisted) across, and `,merge` works. */
 	engineFork?: EngineForkOptions;
+	/** Whether the engine persists heaps, for honest fork replies. */
+	engineHeap?: boolean;
+	/** Default wait for a spawned child's turn. */
+	spawnTimeoutMs?: number;
 	log: (line: string) => void;
 	/** Test seam. */
 	createClient?: () => IrcClient;
@@ -48,7 +53,7 @@ function isSessionGone(error: unknown): boolean {
 	return /unknown session|session was not found/i.test(message(error));
 }
 
-export class IrcPiBot {
+export class IrcPiBot implements ControlHandlers {
 	readonly #options: IrcBotOptions;
 	readonly #irc: IrcClient;
 	readonly #store: ChannelSessionStore;
@@ -353,54 +358,187 @@ export class IrcPiBot {
 			this.say(room, `left ${command.channel}; its session is kept`);
 			return;
 		}
+		if (command.kind === "merge") {
+			const result = await this.mergeInto(room, command.channel, command.strategy);
+			this.say(room, result.message);
+			return;
+		}
 		if (command.kind === "fork") {
 			// Fork the channel the command was typed in into every target; with no
 			// target, into a fresh #<room>-<petname> (DMs fork into #<nick>-<petname>).
-			const sourceLink = await this.#linkFor(room);
-			const base = isChannel(room) ? room : `#${room.toLowerCase()}`;
-			const targets =
-				command.channels.length > 0
-					? command.channels
-					: [forkChannelName(base, (candidate) => this.#store.get(candidate) !== undefined)];
+			const targets = command.channels.length > 0 ? command.channels : [this.#freshChannelName(room)];
 			for (const channel of targets) {
-				if (channel === room) {
-					this.say(room, `${channel} is this channel; pick another target`);
-					continue;
-				}
-				if (this.#store.get(channel)) {
-					this.say(
-						room,
-						`${channel} already has a session (${this.#store.get(channel)?.sessionId}); ,part it and remove it from the state file to refork`,
-					);
-					continue;
-				}
 				try {
-					const created = await sourceLink.services.management.fork(sourceLink.sessionId, {}, BACKGROUND_CONTEXT);
-					let engine = "no engine state to carry";
-					if (this.#options.engineFork) {
-						try {
-							const carried = await forkEngineSession(
-								sourceLink.sessionId,
-								created.sessionId,
-								this.#options.engineFork,
-							);
-							engine = carried ? "heap and files carried over" : "source had no engine state yet";
-						} catch (error) {
-							engine = `engine state NOT carried: ${message(error)}`;
-						}
-					}
-					this.#store.set(channel, {
-						sessionId: created.sessionId,
-						createdAt: created.createdAt,
-						forkedFrom: room,
-					});
-					this.#irc.join(channel);
-					this.say(room, `forked ${room} -> ${channel} (session ${created.sessionId}; ${engine})`);
+					const forked = await this.#forkInto(room, channel);
+					this.say(room, `forked ${room} -> ${channel} (session ${forked.sessionId}; ${forked.note})`);
 				} catch (error) {
 					this.say(room, `fork ${room} -> ${channel} failed: ${message(error)}`);
 				}
 			}
 		}
+	}
+
+	/** `#<room>-<petname>` that no channel record uses yet. */
+	#freshChannelName(room: string): string {
+		const base = isChannel(room) ? room : `#${room.toLowerCase()}`;
+		return forkChannelName(base, (candidate) => this.#store.get(candidate) !== undefined);
+	}
+
+	/**
+	 * Fork `room`'s Session into `channel` (conversation, and engine files
+	 * when a coordinator is configured), remember the fork base, and join.
+	 */
+	async #forkInto(room: string, channel: string): Promise<{ sessionId: string; note: string }> {
+		if (channel === room) throw new Error(`${channel} is this channel; pick another target`);
+		const existing = this.#store.get(channel);
+		if (existing) {
+			throw new Error(
+				`${channel} already has a session (${existing.sessionId}); ,part it and remove it from the state file to refork`,
+			);
+		}
+		const sourceLink = await this.#linkFor(room);
+		const created = await sourceLink.services.management.fork(sourceLink.sessionId, {}, BACKGROUND_CONTEXT);
+		let note = "conversation carried over";
+		let forkBaseFs: string | undefined;
+		if (this.#options.engineFork) {
+			try {
+				const carried = await forkEngineSession(sourceLink.sessionId, created.sessionId, this.#options.engineFork);
+				forkBaseFs = carried.fs;
+				note = carried.seeded
+					? `files${this.#options.engineHeap && carried.heap ? ", heap," : ""} and conversation carried over`
+					: "conversation carried over; the source had no files yet";
+			} catch (error) {
+				note = `conversation carried over; files NOT carried: ${message(error)}`;
+			}
+		}
+		this.#store.set(channel, {
+			sessionId: created.sessionId,
+			createdAt: created.createdAt,
+			forkedFrom: room,
+			...(forkBaseFs === undefined ? {} : { forkBaseFs }),
+		});
+		this.#irc.join(channel);
+		return { sessionId: created.sessionId, note };
+	}
+
+	/** The channel a Session id belongs to, for control calls that identify themselves by session. */
+	#roomForSession(sessionId: string): string {
+		const room = this.#store.channelFor(sessionId);
+		if (room === undefined) throw new Error(`session ${sessionId} is not bound to a channel`);
+		return room;
+	}
+
+	/** Merge `child`'s files into `room`'s Session; the reply text is ready for the channel. */
+	async mergeInto(room: string, child: string, strategy?: MergeStrategy): Promise<MergeResult> {
+		const engine = this.#options.engineFork;
+		if (!engine)
+			return {
+				status: "nothing",
+				reason: "no engine",
+				message: "no mcp-js coordinator is configured; nothing to merge",
+			};
+		const childRecord = this.#store.get(child);
+		if (!childRecord)
+			return { status: "nothing", reason: "unknown child", message: `${child} has no session to merge from` };
+		const parentLink = await this.#linkFor(room);
+		const result = await mergeEngineSessions(
+			{
+				parent: parentLink.sessionId,
+				child: childRecord.sessionId,
+				...(childRecord.forkBaseFs ? { base: childRecord.forkBaseFs } : {}),
+				...(strategy ? { prefer: strategy } : {}),
+			},
+			engine,
+		);
+		if (result.status === "merged") {
+			return {
+				status: "merged",
+				fs: result.fs,
+				message: `merged ${child} into ${room}: files are live (snapshot ${result.fs.slice(0, 12)})`,
+			};
+		}
+		if (result.status === "conflict") {
+			const paths = result.conflicts.map((conflict) => conflict.path).join(", ");
+			return {
+				status: "conflict",
+				conflicts: result.conflicts,
+				message: `merge ${child} into ${room} has conflicts in: ${paths}. Re-run with ours or theirs to resolve (,merge ${child} theirs).`,
+			};
+		}
+		return { status: "nothing", reason: result.reason, message: `nothing to merge from ${child}: ${result.reason}` };
+	}
+
+	// ── control surface for worker-side tools ────────────────────────────────
+
+	async spawn(request: SpawnRequest): Promise<SpawnResult> {
+		const room = this.#roomForSession(request.session);
+		const channel = request.name
+			? isChannel(request.name)
+				? request.name.toLowerCase()
+				: `#${request.name.toLowerCase()}`
+			: this.#freshChannelName(room);
+		const forked = await this.#forkInto(room, channel);
+		this.say(room, `spawned ${channel} (session ${forked.sessionId}; ${forked.note})`);
+		const link = await this.#linkFor(channel);
+		const timeoutMs = (request.timeoutSeconds ?? 0) * 1000 || this.#options.spawnTimeoutMs || 600_000;
+		let partial = "";
+		const relay = {
+			text: (lines: string[]) => {
+				partial = lines.join("\n");
+				this.say(channel, lines);
+			},
+			tool: (line: string) => this.say(channel, line),
+		};
+		this.say(channel, `[from ${room}] ${request.prompt}`.split("\n"));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		});
+		try {
+			const outcome = await Promise.race([
+				link.prompt(framePrompt(channel, room, request.prompt), relay).then((result) => result.text),
+				timeout,
+			]);
+			if (outcome === "timeout") {
+				await link.abort().catch(() => {});
+				return { channel, sessionId: forked.sessionId, status: "timeout", text: partial };
+			}
+			return { channel, sessionId: forked.sessionId, status: "completed", text: outcome || partial };
+		} catch (error) {
+			return { channel, sessionId: forked.sessionId, status: "failed", text: partial, error: message(error) };
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	async send(request: SendRequest): Promise<void> {
+		const room = this.#roomForSession(request.session);
+		const channel = isChannel(request.channel) ? request.channel.toLowerCase() : request.channel;
+		if (isChannel(channel) && !this.#store.get(channel) && !this.#links.has(channel)) {
+			throw new Error(`not in ${channel}; ,join it first`);
+		}
+		this.say(channel, request.text.split("\n"));
+		// The bot never hears its own lines, so a mention in the text prompts the
+		// target channel's Session here, attributed to the sending channel.
+		const mentioned = mentionText(request.text, this.#nick);
+		if (mentioned !== undefined && channel !== room && isChannel(channel)) {
+			void this.#linkFor(channel)
+				.then((link) =>
+					link.prompt(framePrompt(channel, room, mentioned), {
+						text: (lines) => this.say(channel, lines),
+						tool: (line) => this.say(channel, line),
+					}),
+				)
+				.catch((error) => this.say(channel, `error: ${message(error)}`));
+		}
+	}
+
+	async merge(request: MergeRequest): Promise<MergeResult> {
+		const room = this.#roomForSession(request.session);
+		const child = isChannel(request.channel) ? request.channel.toLowerCase() : `#${request.channel.toLowerCase()}`;
+		const result = await this.mergeInto(room, child, request.strategy);
+		this.say(room, result.message);
+		return result;
 	}
 
 	async close(): Promise<void> {

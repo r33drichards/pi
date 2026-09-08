@@ -115,25 +115,30 @@ export class SessionLink {
 	 * another; a prompt arriving mid-turn is delivered as steering instead of
 	 * waiting, so the model sees it while it works.
 	 */
-	async prompt(message: string, relay: RelayEvents): Promise<void> {
+	async prompt(message: string, relay: RelayEvents): Promise<{ text: string; steered: boolean }> {
 		if (this.#queue > 0) {
 			const response = await this.#services.agent.steer({ message, images: null }, BACKGROUND_CONTEXT);
 			if (!response.accepted) throw new Error(response.error.message);
-			return;
+			return { text: "", steered: true };
 		}
 		this.#queue += 1;
 		const run = this.#running.then(() => this.#runPrompt(message, relay));
-		this.#running = run.catch(() => {});
+		this.#running = run.then(
+			() => {},
+			() => {},
+		);
 		try {
-			await run;
+			return { text: await run, steered: false };
 		} finally {
 			this.#queue -= 1;
 		}
 	}
 
-	async #runPrompt(message: string, relay: RelayEvents): Promise<void> {
+	/** Run one prompt to completion; resolves with the last completed assistant text. */
+	async #runPrompt(message: string, relay: RelayEvents): Promise<string> {
 		const transcript = this.#services.transcript;
 		let tail = Promise.resolve();
+		let lastText = "";
 		const unsubscribe = transcript.state.subscribe((value, _context, delivery) => {
 			if (delivery.kind !== "update" || value.event === null) return;
 			const event = value.event;
@@ -141,7 +146,9 @@ export class SessionLink {
 				switch (event.type) {
 					case "message_end": {
 						if (event.message.role !== "assistant") return;
-						const lines = toIrcLines(textOf(event.message.content));
+						const text = textOf(event.message.content);
+						if (text.trim().length > 0) lastText = text;
+						const lines = toIrcLines(text);
 						if (lines.length > 0) relay.text(lines);
 						return;
 					}
@@ -164,6 +171,7 @@ export class SessionLink {
 			unsubscribe();
 			await tail;
 		}
+		return lastText;
 	}
 
 	async abort(): Promise<boolean> {

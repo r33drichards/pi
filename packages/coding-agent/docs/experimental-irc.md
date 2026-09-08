@@ -49,12 +49,32 @@ Channel control commands:
 | `,join #a,#b` | Join channels; each gets a new Session (or its remembered one). |
 | `,fork [#a,#b]` | Join each channel with a Session forked from the channel the command was typed in. With no channel, forks into a fresh `#<channel>-<petname>` (for example `#clone-brave-otter`, names from `node-petname`, retried if taken). The conversation tree is copied with `SessionManagement.fork`; with an mcp-js coordinator the source's latest heap and filesystem snapshot are carried over too (`engine-fork.ts`). The bot replies `forked #pi -> #a (session …; heap and files carried over)` per target. |
 | `,part #chan` | Leave; the Session is kept and reused on the next `,join`. |
+| `,merge #child [ours\|theirs]` | Merge a forked child's files back into this channel's Session: a three-way merge (`POST /api/fs/merge`) with base = the fork point's snapshot (recorded in the state file as `forkBaseFs`), ours = this Session's latest snapshot, theirs = the child's latest. On success the merged snapshot is folded into this Session's log, so `run_js` and the file tools see it at once. Conflicting paths are reported; `ours` or `theirs` resolves them. |
 | `,sessions` | List channel → session. |
 | `,help` | Command reference. |
 
 Channel → session mappings live in `<agentDir>/irc/channels.json`
 (`PI_IRC_STATE_DIR` or `--state-dir`), so a restart rejoins every remembered
 channel and reattaches its Session.
+
+## Delegation tools
+
+Under `pi irc` every session worker also gets three tools, registered only
+when the presentation's loopback control endpoint is configured
+(`PI_IRC_CONTROL_URL` / `PI_IRC_CONTROL_TOKEN`, set for the workers by the
+`pi irc` process; `control.ts`, `tools.ts`):
+
+- `spawn_channel({ prompt, name?, timeoutSeconds? })`: forks the calling
+  channel into `#<channel>-<petname>` (or `name`), joins it, runs `prompt` as
+  the child's turn (its tool calls and reply appear in the child channel),
+  waits for the child's run to finish through the Session services (with a
+  timeout that aborts the child and returns partial text), and returns the
+  child's final answer, channel, and session id.
+- `irc_send({ channel, text })`: posts to a channel the bot is in, rate
+  limited and line split. A mention of the bot in the text prompts that
+  channel's Session, attributed to the sending channel, so channels can talk
+  to each other in the open.
+- `merge_channel({ channel, strategy? })`: the `,merge` command as a tool.
 
 ## Configuration
 
@@ -72,6 +92,7 @@ Flags win over environment variables:
 | `--all` | `IRC_RESPOND_TO_ALL` | off |
 | `--state-dir` | `PI_IRC_STATE_DIR` | `<agentDir>/irc` |
 | `--web-port`, `--web-token` | `PI_WEB_PORT`, `PI_WEB_TOKEN`, `PI_WEB_HOST` | web gateway off |
+| | `PI_IRC_CONTROL_URL`, `PI_IRC_CONTROL_TOKEN` | set by `pi irc` for its workers; do not set by hand |
 
 With `--web-port`, the `pi web` gateway runs on the same server, so every
 channel's Session can be watched in the browser.

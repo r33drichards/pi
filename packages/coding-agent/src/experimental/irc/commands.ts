@@ -9,6 +9,7 @@
  *   ,fork [#a,#b]   fork the current channel's session into each channel; no
  *                   argument forks into an auto-named #<channel>-<petname>
  *   ,part #chan     leave a channel; its session stays for a later ,join
+ *   ,merge #child   merge the child's files back into this channel's session
  *   ,sessions       list channel -> session
  *   ,help
  *
@@ -23,6 +24,7 @@ export type ControlCommand =
 	/** No channels: fork into an auto-named `#<channel>-<petname>`. */
 	| { kind: "fork"; channels: string[] }
 	| { kind: "part"; channel: string }
+	| { kind: "merge"; channel: string; strategy?: "ours" | "theirs" }
 	| { kind: "sessions" }
 	| { kind: "help" };
 
@@ -37,6 +39,10 @@ const CONTROL_COMMANDS = [
 		description: "join channels with sessions forked from this channel's (conversation, files, heap)",
 	},
 	{ usage: "part #chan", description: "leave a channel (its session is kept)" },
+	{
+		usage: "merge #child [ours|theirs]",
+		description: "merge a forked child's files back into this channel (three-way from the fork point)",
+	},
 	{ usage: "sessions", description: "list channel → session" },
 	{ usage: "help", description: "this list" },
 ] as const;
@@ -44,7 +50,7 @@ const CONTROL_COMMANDS = [
 export const HELP_LINES = [
 	...SESSION_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
 	...CONTROL_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
-	"Mention me to talk (pi: … / … pi …) or DM me. `pi ,fork ptest2,ptest3` runs a command in a mention; # is optional; `pi ,fork` alone forks into #<channel>-<petname>.",
+	"Mention me to talk (pi: … / … pi …) or DM me. `pi ,fork ptest2,ptest3` runs a command in a mention; # is optional; `pi ,fork` alone forks into #<channel>-<petname>; ask me to spawn a child channel and merge it back.",
 ];
 
 const CHANNEL = /^[#&][^\s,\x07]{1,63}$/;
@@ -101,6 +107,16 @@ export function parseCommand(line: string): IrcCommand | undefined {
 			const { channels } = parseChannelList(argument);
 			if (channels.length !== 1) return { kind: "error", message: "Usage: ,part #channel" };
 			return { kind: "part", channel: channels[0]! };
+		}
+		case "merge": {
+			const parts = argument.split(/\s+/).filter((part) => part.length > 0);
+			const [target, strategyText, ...rest] = parts;
+			const channel = target === undefined ? undefined : normalizeChannel(target);
+			const strategy = strategyText === "ours" || strategyText === "theirs" ? strategyText : undefined;
+			if (channel === undefined || rest.length > 0 || (strategyText !== undefined && strategy === undefined)) {
+				return { kind: "error", message: "Usage: ,merge #child [ours|theirs]" };
+			}
+			return strategy === undefined ? { kind: "merge", channel } : { kind: "merge", channel, strategy };
 		}
 		case "sessions":
 			return { kind: "sessions" };

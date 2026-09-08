@@ -14,7 +14,8 @@ import type { RunningServer, startForegroundServer } from "../server.ts";
 import { buildWebApp } from "../web/build.ts";
 import { startWebGateway } from "../web/gateway.ts";
 import { type IrcBotOptions, IrcPiBot } from "./bot.ts";
-import type { EngineForkOptions } from "./engine-fork.ts";
+import { CONTROL_TOKEN_ENV, CONTROL_URL_ENV, type ControlServer, startControlServer } from "./control.ts";
+import { type EngineForkOptions, engineCapabilities } from "./engine-fork.ts";
 
 export type StartServer = typeof startForegroundServer;
 
@@ -84,6 +85,17 @@ export async function runIrcPresentation(
 	const log = options.log ?? ((line: string) => console.log(line));
 	const env = options.env ?? process.env;
 	const config = resolveIrcConfig(command, env, getAgentDir());
+	// The control surface must exist before the server so every session worker
+	// inherits its address and token and registers the delegation tools.
+	let control: ControlServer | undefined;
+	const handlers: { current: IrcPiBot | undefined } = { current: undefined };
+	control = await startControlServer({
+		spawn: (request) => handlers.current!.spawn(request),
+		send: (request) => handlers.current!.send(request),
+		merge: (request) => handlers.current!.merge(request),
+	});
+	process.env[CONTROL_URL_ENV] = control.url;
+	process.env[CONTROL_TOKEN_ENV] = control.token;
 	const server: RunningServer = await startServer({
 		serverId: command.serverId,
 		sessionDir: command.sessionDir,
@@ -113,13 +125,25 @@ export async function runIrcPresentation(
 			log(`Web: ${gateway.url}${token ? " (token required: append ?token=<your token>)" : ""}`);
 		}
 		const engineFork = resolveEngineFork(process.cwd());
+		let engineHeap = false;
+		if (engineFork) {
+			try {
+				engineHeap = (await engineCapabilities(engineFork)).heap;
+			} catch (error) {
+				log(
+					`IRC: could not read engine capabilities from ${engineFork.url}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		const botOptions: IrcBotOptions = {
 			...config,
 			target: { serverId: server.serverId, socketPath: server.socketPath },
-			...(engineFork === undefined ? {} : { engineFork }),
+			...(engineFork === undefined ? {} : { engineFork, engineHeap }),
 			log,
 		};
 		bot = new IrcPiBot(botOptions);
+		handlers.current = bot;
+		log(`Control: ${control.url} (delegation tools enabled for session workers)`);
 		log(
 			`IRC: connecting to ${config.server}:${config.port}${config.tls ? " (tls)" : ""} as ${config.nick}, control ${config.controlChannel}`,
 		);
@@ -146,6 +170,7 @@ export async function runIrcPresentation(
 		await bot?.close();
 		await gateway?.close();
 		await server.close();
+		await control?.close();
 		if (buildRoot) await rm(buildRoot, { recursive: true, force: true });
 	}
 }

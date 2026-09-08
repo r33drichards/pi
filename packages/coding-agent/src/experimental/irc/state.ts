@@ -12,6 +12,8 @@ export interface ChannelRecord {
 	createdAt: number;
 	/** The channel this session was forked from, when it was. */
 	forkedFrom?: string;
+	/** The source's filesystem snapshot id at fork time: the merge base for `,merge`. */
+	forkBaseFs?: string;
 }
 
 interface StateFile {

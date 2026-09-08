@@ -202,11 +202,11 @@ describe("engine fork over the coordinator API", () => {
 		}) as unknown as typeof fetch;
 		await expect(
 			forkEngineSession("src", "dst", { url: "http://engine/", fetch: fakeFetch, pollMs: 1 }),
-		).resolves.toBe(true);
+		).resolves.toEqual({ seeded: true, fs: "f2", heap: "h2" });
 		expect(calls[1]?.body).toEqual({ session: "dst", code: "// forked from session src", heap: "h2", fs: "f2" });
-		await expect(forkEngineSession("missing", "dst", { url: "http://engine", fetch: fakeFetch })).resolves.toBe(
-			false,
-		);
+		await expect(forkEngineSession("missing", "dst", { url: "http://engine", fetch: fakeFetch })).resolves.toEqual({
+			seeded: false,
+		});
 	});
 });
 
