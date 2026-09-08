@@ -10,6 +10,7 @@ import { DefaultResourceLoader } from "../core/resource-loader.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { type IrcBotOptions, IrcPiBot } from "./bot.ts";
 import { type EngineForkOptions, engineCapabilities } from "./engine-fork.ts";
+import { clearFaultingDomain, faultingDomain, installFaultDomains } from "./fault-domain.ts";
 
 export interface IrcCommand {
 	readonly server?: string;
@@ -146,13 +147,18 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 		log,
 	};
 	const bot = new IrcPiBot(botOptions);
-	// An extension's background timer must not take the bot down with it. The
-	// classic runtime expects one session per process; here there is one per
-	// channel, and an extension holding a captured context across sessions can
-	// throw from a timer long after the call that created it.
+	// A timer an extension started keeps the channel that created it, so a
+	// failure names its channel instead of just ending the process.
+	const uninstallDomains = installFaultDomains();
 	const onFault = (kind: string) => (error: unknown) => {
+		const channel = faultingDomain();
+		clearFaultingDomain();
+		if (channel !== undefined) {
+			bot.onChannelFault(channel, error);
+			return;
+		}
 		log(
-			`IRC: uncaught ${kind} (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+			`IRC: uncaught ${kind} outside any channel (continuing): ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
 		);
 	};
 	const onUncaught = onFault("exception");
@@ -184,6 +190,7 @@ export async function runIrc(command: IrcCommand, options: RunIrcOptions = {}): 
 	} finally {
 		process.off("uncaughtException", onUncaught);
 		process.off("unhandledRejection", onRejection);
+		uninstallDomains();
 		await bot.close();
 	}
 }

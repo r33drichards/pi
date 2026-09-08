@@ -18,6 +18,7 @@ import { createAgentSession } from "../core/sdk.ts";
 import { SessionManager } from "../core/session-manager.ts";
 import type { SettingsManager } from "../core/settings-manager.ts";
 import type { EngineForkOptions } from "./engine-fork.ts";
+import { runInDomain } from "./fault-domain.ts";
 import { describeToolCall, describeToolResult, toIrcLines } from "./format.ts";
 import { type ChannelDelegate, createDelegationTools, createSandboxTools } from "./tools.ts";
 
@@ -96,7 +97,13 @@ export class ChannelSession {
 	 * after the pi session so forks can carry engine state), its tools, and the
 	 * extension bindings every host has to install.
 	 */
-	static async open(
+	static open(channel: string, deps: ChannelSessionDeps, options: OpenChannelSession = {}): Promise<ChannelSession> {
+		// Everything this session does — extension setup included — belongs to
+		// this channel, so timers it starts report their failures here.
+		return runInDomain(channel, () => ChannelSession.#open(channel, deps, options));
+	}
+
+	static async #open(
 		channel: string,
 		deps: ChannelSessionDeps,
 		options: OpenChannelSession = {},
@@ -220,10 +227,12 @@ export class ChannelSession {
 		// The channel's own relay is already attached for the session's lifetime;
 		// an extra one here is only for callers that need to capture the text.
 		const stop = relay ? this.watch(relay) : () => {};
-		const run = this.#running.then(async () => {
-			await this.session.prompt(message);
-			return this.session.getLastAssistantText() ?? "";
-		});
+		const run = this.#running.then(() =>
+			runInDomain(this.channel, async () => {
+				await this.session.prompt(message);
+				return this.session.getLastAssistantText() ?? "";
+			}),
+		);
 		this.#running = run.then(
 			() => {},
 			() => {},
