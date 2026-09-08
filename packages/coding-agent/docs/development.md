@@ -30,7 +30,7 @@ PI_EXPERIMENTAL=1 ./pi-test.sh client
 
 `PI_SERVER_DIR` overrides the server profile and socket directory (default: `~/.pi/server`). `PI_SERVER_ID` selects the logical server ID when `--server-id` is omitted.
 
-`PI_EXPERIMENTAL=1 ./pi-test.sh web [--port 8600] [--token <t>]` starts the same server plus a browser gateway serving a sessions-only web app; see [experimental-web.md](experimental-web.md). Start it from a directory whose settings select the mcp-js environment to get `read`/`write`/`run_js` sessions.
+`PI_EXPERIMENTAL=1 ./pi-test.sh web [--port 8600] [--token <t>]` starts the same server plus a browser gateway serving a sessions-only web app; see [experimental-web.md](experimental-web.md). Start it from a directory whose settings select the mcp-js environment to get `read`/`write`/`run_js` sessions. `docker compose up --build` at the repository root runs the same thing together with an mcp-js engine, configured from `docker/web/config/` and `.env`.
 
 `PI_EXPERIMENTAL=1 ./pi-test.sh irc --server <host> [--nick pi] [--web-port 8600]` joins an IRC network with one Session per channel, controlled from `#pi` with `,join` and `,fork`; see [experimental-irc.md](experimental-irc.md).
 

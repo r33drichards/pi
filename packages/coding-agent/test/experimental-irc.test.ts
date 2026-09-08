@@ -155,6 +155,12 @@ describe("irc formatting", () => {
 		);
 		expect(describeToolCall("read", { path: "/x.txt" })).toBe("[read] /x.txt");
 		expect(describeToolCall("mystery", {})).toBe("[mystery]");
+		expect(describeToolCall("spawn_channel", { prompt: "write a plan\nplease" })).toBe(
+			"[spawn_channel] write a plan",
+		);
+		expect(describeToolCall("merge_channel", { channel: "#pi-x", strategy: "theirs" })).toBe(
+			"[merge_channel] #pi-x (theirs)",
+		);
 		expect(describeToolResult("run_js", "42", false)).toBe("[run_js] → 42");
 		expect(describeToolResult("run_js", "a\nb\nc", false)).toBe("[run_js] → a (+2 lines)");
 		expect(describeToolResult("read", "ENOENT", true)).toBe("[read] error: ENOENT");

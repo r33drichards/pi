@@ -34,6 +34,14 @@ export function describeToolCall(name: string, args: unknown): string {
 	}
 	if (name === "bash" && typeof record.command === "string")
 		return `[bash] ${firstLine(record.command).slice(0, 100)}`;
+	if (name === "spawn_channel" && typeof record.prompt === "string") {
+		const target = typeof record.name === "string" ? ` ${record.name}` : "";
+		return `[spawn_channel]${target} ${firstLine(record.prompt).slice(0, 100)}`;
+	}
+	if (name === "irc_send" && typeof record.channel === "string") return `[irc_send] ${record.channel}`;
+	if (name === "merge_channel" && typeof record.channel === "string") {
+		return `[merge_channel] ${record.channel}${typeof record.strategy === "string" ? ` (${record.strategy})` : ""}`;
+	}
 	return `[${name}]`;
 }
 
