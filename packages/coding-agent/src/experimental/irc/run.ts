@@ -110,7 +110,7 @@ export async function runIrcPresentation(
 				port: webPort,
 				...(token === undefined ? {} : { token }),
 			});
-			log(`Web: ${gateway.url}${token ? `/?token=${token}` : ""}`);
+			log(`Web: ${gateway.url}${token ? " (token required: append ?token=<your token>)" : ""}`);
 		}
 		const engineFork = resolveEngineFork(process.cwd());
 		const botOptions: IrcBotOptions = {

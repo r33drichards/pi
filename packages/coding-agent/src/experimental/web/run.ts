@@ -46,7 +46,7 @@ export async function runWebGateway(
 		});
 		log(`Server: ${server.serverId}`);
 		log(`Socket: ${server.socketPath}`);
-		log(`Web: ${gateway.url}${command.token ? `/?token=${command.token}` : ""}`);
+		log(`Web: ${gateway.url}${command.token ? " (token required: append ?token=<your token>)" : ""}`);
 		try {
 			await new Promise<void>((resolve, reject) => {
 				const cleanup = (): void => {
