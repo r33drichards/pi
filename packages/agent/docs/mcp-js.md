@@ -180,6 +180,13 @@ snapshot for `files: "session"`, and `<agentDir>/mcp-js/sessions/<sessionId>`
 on the host for `files: "host"` and for the session store. The directory the pi
 server was started from only supplies the settings that selected mcp-js.
 
+`network: true` and `modules: true` in the `mcpJs` settings declare that the
+engine's fetch and modules policies allow the guest out (the engine does not
+report this over its API); the `run_js` description then explains that
+`fetch` and `import()` of ESM URLs work and shows an isomorphic-git clone
+recipe. Without them it states plainly that there is no network and no
+`import()`.
+
 The `run_js` tool description carries the environment's `runtimeDescription`:
 that mcp-js is a bare V8 sandbox without `process`, `require`, `import`, or a
 `Deno` namespace, that `globalThis.fs` is the only I/O and shares the file

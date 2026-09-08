@@ -79,6 +79,19 @@ export interface McpJsNativeEngine {
 export interface McpJsSessionBinding {
 	session?: string;
 	files?: "host" | "session";
+	/**
+	 * What the guest can reach beyond the filesystem. The engine does not
+	 * report these over its API, so the embedding states them from its own
+	 * server configuration; they only change the `run_js` description.
+	 */
+	guest?: McpJsGuestCapabilities;
+}
+
+export interface McpJsGuestCapabilities {
+	/** `fetch` works (subject to the server's fetch policy). */
+	network?: boolean;
+	/** `import()` of ES module URLs works (subject to the server's modules policy). */
+	modules?: boolean;
 }
 
 const MODE_TYPE_MASK = 0o170000;
@@ -138,17 +151,36 @@ function nativeMessage(error: unknown): string {
  * a bare V8 sandbox, not Node or Deno, and its only I/O is the `fs` global over
  * the same filesystem the read and write tools see.
  */
-export function describeMcpJsRuntime(cwd: string, files: "host" | "session", heap: boolean): string {
+export function describeMcpJsRuntime(
+	cwd: string,
+	files: "host" | "session",
+	heap: boolean,
+	guest: McpJsGuestCapabilities = {},
+): string {
 	const where =
 		files === "session"
 			? `an isolated per-session filesystem that starts empty; the read and write tools see the same files`
 			: `the host filesystem as allowed by policy; the read and write tools see the same files`;
+	const absent = ["process", "require", "Buffer", "Deno namespace", "shell or subprocess"];
+	if (!guest.modules) absent.splice(2, 0, "import");
+	const network = guest.network
+		? `Network: fetch works for hosts the server's fetch policy allows (send a User-Agent header for api.github.com).`
+		: `Network: none; fetch is unavailable.`;
+	const modules = guest.modules
+		? `Modules: dynamic import() of ES module URLs from the allowed CDNs works, e.g. const m = await import("https://esm.sh/some-package@1"). Bare npm specifiers do not resolve; use the esm.sh URL.`
+		: `Modules: no import(); only the globals below exist.`;
+	const clone =
+		guest.network && guest.modules
+			? ` Git: clone repositories into the filesystem with isomorphic-git, for example: const git = (await import("https://esm.sh/isomorphic-git@1.27.1")).default; const http = (await import("https://esm.sh/isomorphic-git@1.27.1/http/web")).default; await git.clone({ fs, http, dir: "/repo", url: "https://github.com/owner/repo", depth: 1, singleBranch: true }); console.log(await fs.readdir("/repo")). Prefer depth: 1; large repositories take a minute or more and a lot of memory.`
+			: "";
 	return [
-		`Runtime: the mcp-js V8 sandbox. It is not Node.js or Deno: there is no process, require, import, Buffer, Deno namespace, network, timers beyond the run, or shell.`,
+		`Runtime: the mcp-js V8 sandbox. It is not Node.js or Deno: there is no ${absent.join(", ")}.`,
+		network,
+		modules + clone,
 		`Filesystem: globalThis.fs (readFile, writeFile, appendFile, readdir, stat, lstat, mkdir, rm, rmdir, unlink, rename, copyFile, readlink, exists) over ${where}. Paths are POSIX; use absolute paths, and note the file tools resolve relative paths against ${cwd}. Example: await fs.writeFile('${posix.join(cwd, "out.txt")}', 'hi'); console.log(await fs.readFile('${posix.join(cwd, "out.txt")}', 'utf8')).`,
 		heap
 			? `State: globalThis persists between run_js calls in this session (the V8 heap is saved after each run), so variables you define stay available.`
-			: `State: each run_js call starts from a fresh heap; nothing on globalThis survives between calls.`,
+			: `State: each run_js call starts from a fresh heap; nothing on globalThis survives between calls, but files do.`,
 	].join(" ");
 }
 
@@ -194,7 +226,7 @@ export class McpJsExecutionEnv implements FileSystem, JavaScriptRuntime {
 		this.session = binding.session;
 		this.files = files;
 		this.view = engine.fsView(files === "session" ? binding.session : undefined);
-		this.runtimeDescription = describeMcpJsRuntime(this.cwd, files, capabilities.heap);
+		this.runtimeDescription = describeMcpJsRuntime(this.cwd, files, capabilities.heap, binding.guest ?? {});
 	}
 
 	async runJavaScript(code: string, timeout: number | undefined, context: Context): Promise<JavaScriptResult> {

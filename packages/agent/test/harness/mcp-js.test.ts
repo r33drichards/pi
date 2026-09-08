@@ -215,9 +215,21 @@ describe("native mcp-js adapter boundary (not a native engine test)", () => {
 		expect(createRunJsTool().name).toBe("run_js");
 		expect(env.runtimeDescription).toContain("globalThis.fs");
 		expect(env.runtimeDescription).toContain("/work");
+		// Without guest capabilities the description says so plainly.
+		expect(env.runtimeDescription).toContain("Network: none");
+		expect(env.runtimeDescription).toContain("no import()");
+		expect(env.runtimeDescription).not.toContain("isomorphic-git");
+		// With network and modules it explains fetch, import(), and how to clone a repository.
+		const connected = new McpJsExecutionEnv(engine, "/work", { guest: { network: true, modules: true } });
+		expect(connected.runtimeDescription).toContain("fetch works");
+		expect(connected.runtimeDescription).toContain('import("https://esm.sh/');
+		expect(connected.runtimeDescription).toContain("isomorphic-git@1.27.1");
+		expect(connected.runtimeDescription).toContain("git.clone({ fs, http");
+		expect(connected.runtimeDescription).not.toMatch(/there is no [^.]*\bimport\b/);
 		expect(createRunJsTool({ runtimeDescription: env.runtimeDescription }).description).toContain("globalThis.fs");
 		expect(createRunJsTool().description).not.toContain("globalThis.fs");
-		expect(engine.viewRequests).toEqual([undefined]);
+		// One host view for the fixture env, one for the capability-description env above.
+		expect(engine.viewRequests).toEqual([undefined, undefined]);
 	});
 
 	it("moves file bytes through typed native calls, never through JavaScript", async () => {

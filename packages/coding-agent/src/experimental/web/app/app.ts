@@ -13,6 +13,7 @@ import { repeat } from "lit/directives/repeat.js";
 import type { ModelSummary, ModelsState } from "../../services/models.ts";
 import type { SessionSummary } from "../../services/sessions.ts";
 import type { TranscriptState } from "../../services/transcript.ts";
+import { filterModels } from "../../session-commands.ts";
 import { COMMANDS, completeCommand, parseComposerInput, THINKING_LEVELS } from "./commands.ts";
 import { connectWebRuntime, type WebRuntime } from "./runtime.ts";
 
@@ -527,11 +528,7 @@ export class PiSessionsApp extends LitElement {
 	}
 
 	#renderModelPicker(): TemplateResult {
-		const query = this.modelQuery.toLowerCase();
-		const available = this.models?.catalog.availableModels ?? [];
-		const shown = available.filter((model) =>
-			query.length === 0 ? true : `${model.provider}/${model.modelId} ${model.name}`.toLowerCase().includes(query),
-		);
+		const shown = filterModels(this.models?.catalog.availableModels ?? [], this.modelQuery);
 		return html`<div class="model-picker">
 			<input placeholder="Filter models" .value=${this.modelQuery} @input=${(event: Event) => this.#onModelQuery(event)} @keydown=${(
 				event: KeyboardEvent,

@@ -103,11 +103,26 @@ describe("mcpJs settings select the session worker environment", () => {
 		// The session snapshot starts empty, so the file tools work from its root.
 		expect(env.cwd).toBe("/");
 		expect(env.runtimeDescription).toContain("globalThis.fs");
+		expect(env.runtimeDescription).toContain("Network: none");
 		expect(created.sessionStore).toBeInstanceOf(NodeExecutionEnv);
 		// The host side of the session is a fresh empty directory, not the server's cwd.
 		const hostDir = join(agentDir, "mcp-js", "sessions", "session-1");
 		expect((created.sessionStore as NodeExecutionEnv).cwd).toBe(hostDir);
 		expect(readdirSync(hostDir)).toEqual([]);
+	});
+
+	it("passes network and module capabilities from the settings into the run_js description", async () => {
+		const settings: McpJsSettings = { mode: "coordinator", url: "http://node1:3000", network: true, modules: true };
+		const factory = createMcpJsEnvironmentFactory({
+			readSettings: () => settings,
+			connect: async () => fakeEngine(true),
+			agentDir,
+		});
+		const created = await factory("/repo", "session-net");
+		if (!("execution" in created)) throw new Error("expected environments");
+		const description = (created.execution as McpJsExecutionEnv).runtimeDescription;
+		expect(description).toContain("fetch works");
+		expect(description).toContain("isomorphic-git");
 	});
 
 	it("assembles a standalone engine from the settings with the generated builders", async () => {

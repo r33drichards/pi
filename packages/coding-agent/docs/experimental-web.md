@@ -107,6 +107,36 @@ Regions:
   writes `/notes.txt`, `read` returns it, the final answer renders, no
   console errors.
 
+## Docker
+
+`compose.yml` at the repository root runs the whole stack:
+
+    cp .env.example .env        # set PI_WEB_TOKEN and a provider key
+    docker compose up --build
+    open http://127.0.0.1:8600/?token=<PI_WEB_TOKEN>
+
+- `mcp-js`: the engine, with heap and filesystem snapshot stores on the
+  `mcp-js-data` volume. Not published on the host.
+- `pi-web`: `docker/web/Dockerfile` builds the monorepo (offline model
+  catalog) and runs `pi web --host 0.0.0.0 --token $PI_WEB_TOKEN`. The
+  entrypoint waits for mcp-js before starting.
+- Config is the compose project: `docker/web/config/settings.json` (mounted
+  as the server's project settings; selects the coordinator at
+  `http://mcp-js:3000` and the default model) and
+  `docker/web/config/models.json` (copied into the agent directory; declare
+  custom providers here, see `models.litellm.example.json`). Provider keys
+  and `PI_WEB_TOKEN` come from `.env`; `PI_WEB_PORT` changes the host port.
+- The agent directory (`sessions`, `experimental/sessions`, per-session host
+  dirs, `models.json`) persists on the `pi-agent` volume.
+
+The published `wholelottahoopla/mcp-js` image packages the latest GitHub
+release. Until a release includes the session file endpoints from
+mcp-js#267, build the engine from a local checkout instead:
+
+    MCP_JS_SRC=../mcp-js docker compose -f compose.yml -f compose.mcp-js-source.yml up --build
+
+or point `MCP_JS_IMAGE` in `.env` at a release tag that has them.
+
 ## Notes
 
 - The sidebar lists every session in the server's session directory, which

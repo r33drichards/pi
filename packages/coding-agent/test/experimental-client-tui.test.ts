@@ -245,6 +245,7 @@ describe("experimental client TUI", () => {
 			});
 			serverProvider.provide(SessionManagement, {
 				create,
+				fork: () => create(),
 				async remove() {},
 				async attach(sessionId) {
 					publishReplacement(attachment, { status: "attaching", sessionId });
