@@ -200,13 +200,14 @@ export class IrcPiBot {
 		// `pi ,model astra` is a command in a mention; a bare `,command` counts in the control channel and DMs.
 		const command = body !== undefined ? parseCommand(body) : undefined;
 		if (command) {
-			await this.#onCommand(command, room, isDm);
+			// A command inside a mention is honored in any channel the bot is in.
+			await this.#onCommand(command, room, true);
 			return;
 		}
 		if (mentioned === undefined && control) {
 			const bare = parseCommand(event.message);
 			if (bare) {
-				await this.#onCommand(bare, room, isDm);
+				await this.#onCommand(bare, room, true);
 				return;
 			}
 		}
@@ -279,8 +280,7 @@ export class IrcPiBot {
 		}
 	}
 
-	async #onCommand(command: IrcCommand, room: string, isDm: boolean): Promise<void> {
-		const control = room === this.#options.controlChannel.toLowerCase() || isDm;
+	async #onCommand(command: IrcCommand, room: string, control: boolean): Promise<void> {
 		if (await this.#onSessionCommand(command, room)) return;
 		switch (command.kind) {
 			case "help":
@@ -335,36 +335,46 @@ export class IrcPiBot {
 			return;
 		}
 		if (command.kind === "fork") {
-			const from = (command.from ?? room).toLowerCase();
-			if (this.#store.get(command.channel)) {
-				this.say(
-					room,
-					`${command.channel} already has a session; ,part it and remove it from the state file to refork`,
-				);
-				return;
-			}
-			const sourceLink = await this.#linkFor(from);
-			const created = await sourceLink.services.management.fork(sourceLink.sessionId, {}, BACKGROUND_CONTEXT);
-			let engine = "no engine state to carry";
-			if (this.#options.engineFork) {
-				try {
-					const carried = await forkEngineSession(
-						sourceLink.sessionId,
-						created.sessionId,
-						this.#options.engineFork,
+			// Fork the channel the command was typed in into every target.
+			const sourceLink = await this.#linkFor(room);
+			for (const channel of command.channels) {
+				if (channel === room) {
+					this.say(room, `${channel} is this channel; pick another target`);
+					continue;
+				}
+				if (this.#store.get(channel)) {
+					this.say(
+						room,
+						`${channel} already has a session (${this.#store.get(channel)?.sessionId}); ,part it and remove it from the state file to refork`,
 					);
-					engine = carried ? "heap and files carried over" : "source had no engine state yet";
+					continue;
+				}
+				try {
+					const created = await sourceLink.services.management.fork(sourceLink.sessionId, {}, BACKGROUND_CONTEXT);
+					let engine = "no engine state to carry";
+					if (this.#options.engineFork) {
+						try {
+							const carried = await forkEngineSession(
+								sourceLink.sessionId,
+								created.sessionId,
+								this.#options.engineFork,
+							);
+							engine = carried ? "heap and files carried over" : "source had no engine state yet";
+						} catch (error) {
+							engine = `engine state NOT carried: ${message(error)}`;
+						}
+					}
+					this.#store.set(channel, {
+						sessionId: created.sessionId,
+						createdAt: created.createdAt,
+						forkedFrom: room,
+					});
+					this.#irc.join(channel);
+					this.say(room, `forked ${room} -> ${channel} (session ${created.sessionId}; ${engine})`);
 				} catch (error) {
-					engine = `engine state NOT carried: ${message(error)}`;
+					this.say(room, `fork ${room} -> ${channel} failed: ${message(error)}`);
 				}
 			}
-			this.#store.set(command.channel, {
-				sessionId: created.sessionId,
-				createdAt: created.createdAt,
-				forkedFrom: from,
-			});
-			this.#irc.join(command.channel);
-			this.say(room, `forked ${from} → ${command.channel} as session ${created.sessionId} (${engine})`);
 		}
 	}
 

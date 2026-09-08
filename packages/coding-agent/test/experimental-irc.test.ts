@@ -17,17 +17,39 @@ describe("irc control commands", () => {
 		expect(parseCommand(",join #a,#b")).toEqual({ kind: "join", channels: ["#a", "#b"] });
 		expect(parseCommand(",join #A #b, #a")).toEqual({ kind: "join", channels: ["#a", "#b"] });
 		expect(parseCommand(",join")).toEqual({ kind: "error", message: "Usage: ,join #channel[,#other]" });
-		expect(parseCommand(",join nope")).toEqual({ kind: "error", message: "Not a channel: nope" });
+		expect(parseCommand(",join nope")).toEqual({ kind: "join", channels: ["#nope"] });
 	});
 
 	it("parses fork, part, sessions, help, and unknown commands", () => {
-		expect(parseCommand(",fork #dev")).toEqual({ kind: "fork", channel: "#dev" });
-		expect(parseCommand(",fork #dev #pi")).toEqual({ kind: "fork", channel: "#dev", from: "#pi" });
-		expect(parseCommand(",fork")).toEqual({ kind: "error", message: "Usage: ,fork #channel [#from]" });
+		expect(parseCommand(",fork #dev")).toEqual({ kind: "fork", channels: ["#dev"] });
+		expect(parseCommand(",fork #dev,#ops")).toEqual({ kind: "fork", channels: ["#dev", "#ops"] });
+		expect(parseCommand(",fork")).toEqual({ kind: "error", message: "Usage: ,fork #channel[,#other]" });
 		expect(parseCommand(",part #dev")).toEqual({ kind: "part", channel: "#dev" });
+		expect(parseCommand(",part dev")).toEqual({ kind: "part", channel: "#dev" });
 		expect(parseCommand(",sessions")).toEqual({ kind: "sessions" });
 		expect(parseCommand(",HELP")).toEqual({ kind: "help" });
 		expect(parseCommand(",dance")).toEqual({ kind: "error", message: "Unknown command ,dance. Try ,help" });
+	});
+
+	it("accepts channel names without the # prefix", () => {
+		expect(parseCommand(",join ptest2")).toEqual({ kind: "join", channels: ["#ptest2"] });
+		expect(parseCommand(",join ptest2,#Ops, &local")).toEqual({
+			kind: "join",
+			channels: ["#ptest2", "#ops", "&local"],
+		});
+		expect(parseChannelList("a,,b")).toEqual({ channels: ["#a", "#b"], invalid: [] });
+		expect(parseChannelList("bad name")).toEqual({ channels: ["#bad", "#name"], invalid: [] });
+	});
+
+	it("handles the reported cases: pi ,fork ptest2 and pi ,fork ptest2,ptest3", () => {
+		const inMention = (line: string) => {
+			const body = mentionText(line, "pi");
+			return body === undefined ? undefined : parseCommand(body);
+		};
+		expect(inMention("pi ,fork ptest2")).toEqual({ kind: "fork", channels: ["#ptest2"] });
+		expect(inMention("pi ,fork ptest2,ptest3")).toEqual({ kind: "fork", channels: ["#ptest2", "#ptest3"] });
+		expect(inMention("pi: ,join ptest4, ptest5")).toEqual({ kind: "join", channels: ["#ptest4", "#ptest5"] });
+		expect(inMention("pi ,fork")).toEqual({ kind: "error", message: "Usage: ,fork #channel[,#other]" });
 	});
 
 	it("parses session commands, bare or inside a mention", () => {
@@ -47,6 +69,7 @@ describe("irc control commands", () => {
 		expect(inMention("pi: ,thinking high")).toEqual({ kind: "thinking", level: "high" });
 		expect(inMention("@pi ,compact")).toEqual({ kind: "compact", instructions: null });
 		expect(inMention("pi ,join #dev,#ops")).toEqual({ kind: "join", channels: ["#dev", "#ops"] });
+		expect(inMention("pi ,fork ptest2")).toEqual({ kind: "fork", channels: ["#ptest2"] });
 		expect(inMention("pi ,help")).toEqual({ kind: "help" });
 		// A mention that is not a command stays a prompt; unmentioned commands are not parsed here.
 		expect(inMention("pi model astra")).toBeUndefined();

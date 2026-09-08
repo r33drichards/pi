@@ -6,7 +6,7 @@
  * commands only this presentation has:
  *
  *   ,join #a,#b     join channels; each gets its own session
- *   ,fork #chan     join #chan with a session forked from the current channel's
+ *   ,fork #a,#b     join channels with sessions forked from the current channel's
  *   ,part #chan     leave a channel; its session stays for a later ,join
  *   ,sessions       list channel -> session
  *   ,help
@@ -19,7 +19,7 @@ import { parseSessionCommand, SESSION_COMMANDS, type SessionCommandAction } from
 
 export type ControlCommand =
 	| { kind: "join"; channels: string[] }
-	| { kind: "fork"; channel: string; from?: string }
+	| { kind: "fork"; channels: string[] }
 	| { kind: "part"; channel: string }
 	| { kind: "sessions" }
 	| { kind: "help" };
@@ -30,7 +30,10 @@ export const COMMAND_PREFIX = ",";
 
 const CONTROL_COMMANDS = [
 	{ usage: "join #a,#b", description: "join channels, one session each" },
-	{ usage: "fork #chan [#from]", description: "join #chan with a session forked from #from (default: this channel)" },
+	{
+		usage: "fork #a,#b",
+		description: "join channels with sessions forked from this channel's (conversation, files, heap)",
+	},
 	{ usage: "part #chan", description: "leave a channel (its session is kept)" },
 	{ usage: "sessions", description: "list channel → session" },
 	{ usage: "help", description: "this list" },
@@ -39,25 +42,33 @@ const CONTROL_COMMANDS = [
 export const HELP_LINES = [
 	...SESSION_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
 	...CONTROL_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
-	"Mention me to talk (pi: … / … pi …) or DM me; `pi ,model astra` runs a command in a mention.",
+	"Mention me to talk (pi: … / … pi …) or DM me. `pi ,fork ptest2,ptest3` runs a command in a mention; # is optional.",
 ];
 
-const CHANNEL = /^[#&][^\s,]{1,63}$/;
+const CHANNEL = /^[#&][^\s,\x07]{1,63}$/;
+const CHANNEL_NAME = /^[^\s,\x07#&][^\s,\x07]{0,62}$/;
 
 export function isChannel(name: string): boolean {
 	return CHANNEL.test(name);
 }
 
-/** Split a comma or space separated channel list, validating each entry. */
+/** `ptest2` means `#ptest2`; explicit `#`/`&` prefixes are kept. Undefined when not a channel name. */
+export function normalizeChannel(raw: string): string | undefined {
+	const name = raw.trim();
+	if (isChannel(name)) return name.toLowerCase();
+	if (CHANNEL_NAME.test(name)) return `#${name.toLowerCase()}`;
+	return undefined;
+}
+
+/** Split a comma or space separated channel list, normalizing and validating each entry. */
 export function parseChannelList(text: string): { channels: string[]; invalid: string[] } {
 	const channels: string[] = [];
 	const invalid: string[] = [];
 	for (const raw of text.split(/[,\s]+/)) {
-		const name = raw.trim();
-		if (name.length === 0) continue;
-		if (isChannel(name)) {
-			if (!channels.includes(name.toLowerCase())) channels.push(name.toLowerCase());
-		} else invalid.push(name);
+		if (raw.trim().length === 0) continue;
+		const channel = normalizeChannel(raw);
+		if (channel === undefined) invalid.push(raw.trim());
+		else if (!channels.includes(channel)) channels.push(channel);
 	}
 	return { channels, invalid };
 }
@@ -81,11 +92,9 @@ export function parseCommand(line: string): IrcCommand | undefined {
 		}
 		case "fork": {
 			const { channels, invalid } = parseChannelList(argument);
-			if (invalid.length > 0 || channels.length === 0 || channels.length > 2) {
-				return { kind: "error", message: "Usage: ,fork #channel [#from]" };
-			}
-			const [channel, from] = channels;
-			return from === undefined ? { kind: "fork", channel: channel! } : { kind: "fork", channel: channel!, from };
+			if (invalid.length > 0) return { kind: "error", message: `Not a channel: ${invalid.join(", ")}` };
+			if (channels.length === 0) return { kind: "error", message: "Usage: ,fork #channel[,#other]" };
+			return { kind: "fork", channels };
 		}
 		case "part": {
 			const { channels } = parseChannelList(argument);

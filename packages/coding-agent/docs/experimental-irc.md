@@ -25,9 +25,11 @@ line per tool call and result (`[run_js] 3 lines: …`, `[read] → hi`).
 
 ## Commands
 
-Comma-prefixed. Inside a mention they work anywhere (`pi ,model astra`,
-`pi: ,thinking high`); bare `,command` lines are honored in the control
-channel (default `#pi`) and DMs. `,help` lists all of them.
+Comma-prefixed. Inside a mention every command works in any channel the bot
+is in (`pi ,model astra`, `pi ,fork ptest2`); bare `,command` lines are
+honored in the control channel (default `#pi`) and DMs. Channel arguments
+may omit the `#` (`ptest2` means `#ptest2`) and lists are comma separated.
+`,help` lists all of them.
 
 Session commands act on the channel's own Session and are the same set the
 browser composer has as `/model`, `/thinking`, `/compact`, `/reload`
@@ -40,12 +42,12 @@ browser composer has as `/model`, `/thinking`, `/compact`, `/reload`
 | `,compact [instructions]` | Compact the Session context. |
 | `,reload` | Reload the Session's plugins. |
 
-Channel control commands, accepted in the control channel and DMs:
+Channel control commands:
 
 | Command | Effect |
 | --- | --- |
 | `,join #a,#b` | Join channels; each gets a new Session (or its remembered one). |
-| `,fork #chan [#from]` | Join `#chan` with a Session forked from `#from` (default: the channel the command was typed in). The conversation tree is copied with `SessionManagement.fork`; with an mcp-js coordinator the source's latest heap and filesystem snapshot are carried over too (`engine-fork.ts`). |
+| `,fork #a,#b` | Join each channel with a Session forked from the channel the command was typed in. The conversation tree is copied with `SessionManagement.fork`; with an mcp-js coordinator the source's latest heap and filesystem snapshot are carried over too (`engine-fork.ts`). The bot replies `forked #pi -> #a (session …; heap and files carried over)` per target. |
 | `,part #chan` | Leave; the Session is kept and reused on the next `,join`. |
 | `,sessions` | List channel → session. |
 | `,help` | Command reference. |
