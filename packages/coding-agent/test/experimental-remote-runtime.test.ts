@@ -323,6 +323,16 @@ describe("experimental durable server composition", () => {
 			expect(firstDirectory.state.value?.sessions.map(({ sessionId }) => sessionId)).toContain("demo-3");
 			expect(secondDirectory.state.value).toEqual(firstDirectory.state.value);
 		});
+		// A fork copies the source's tree into a new Session and lists it alongside the source.
+		const forked = await secondManagement.fork("demo-1", { id: "demo-1-fork" }, BACKGROUND_CONTEXT);
+		expect(forked).toMatchObject({ serverId: runtime.serverId, sessionId: "demo-1-fork" });
+		await vi.waitFor(() => {
+			const ids = firstDirectory.state.value?.sessions.map(({ sessionId }) => sessionId) ?? [];
+			expect(ids).toContain("demo-1");
+			expect(ids).toContain("demo-1-fork");
+			expect(secondDirectory.state.value).toEqual(firstDirectory.state.value);
+		});
+		await expect(secondManagement.fork("missing-session", {}, BACKGROUND_CONTEXT)).rejects.toThrow();
 
 		await Promise.all([
 			firstManagement.attach("demo-1", BACKGROUND_CONTEXT),

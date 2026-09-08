@@ -25,6 +25,7 @@ export interface ExperimentalServerServices {
 export async function createExperimentalServerServices(options: {
 	list(context: Context): Promise<SessionSummary[]>;
 	create(createOptions: SessionCreateOptions, context: Context): Promise<SessionSummary>;
+	fork(sourceSessionId: string, createOptions: SessionCreateOptions, context: Context): Promise<SessionSummary>;
 	remove(sessionId: string, context: Context): Promise<void>;
 	prepareSessionPlugins(
 		sessionId: string,
@@ -90,6 +91,12 @@ export async function createExperimentalServerServices(options: {
 					create: (createOptions, context) =>
 						serialize(async () => {
 							const created = await options.create(createOptions, context);
+							await refreshNow(context);
+							return created;
+						}),
+					fork: (sourceSessionId, createOptions, context) =>
+						serialize(async () => {
+							const created = await options.fork(sourceSessionId, createOptions, context);
 							await refreshNow(context);
 							return created;
 						}),

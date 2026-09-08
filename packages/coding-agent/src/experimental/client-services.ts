@@ -46,6 +46,7 @@ export async function activateBuiltinClientServices<T extends ConnectedClientSer
 	const remoteManagement = serverServices.use(SessionManagement);
 	const management: SessionManagement = {
 		create: (options, context) => remoteManagement.create(options, context),
+		fork: (sourceSessionId, options, context) => remoteManagement.fork(sourceSessionId, options, context),
 		async remove(sessionId, context) {
 			const removesCurrentAttachment = server.client.attachment?.sessionId === sessionId;
 			await remoteManagement.remove(sessionId, context);

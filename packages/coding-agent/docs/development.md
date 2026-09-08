@@ -32,6 +32,8 @@ PI_EXPERIMENTAL=1 ./pi-test.sh client
 
 `PI_EXPERIMENTAL=1 ./pi-test.sh web [--port 8600] [--token <t>]` starts the same server plus a browser gateway serving a sessions-only web app; see [experimental-web.md](experimental-web.md). Start it from a directory whose settings select the mcp-js environment to get `read`/`write`/`run_js` sessions.
 
+`PI_EXPERIMENTAL=1 ./pi-test.sh irc --server <host> [--nick pi] [--web-port 8600]` joins an IRC network with one Session per channel, controlled from `#pi` with `,join` and `,fork`; see [experimental-irc.md](experimental-irc.md).
+
 The `client` and `experimental/plugin` package subpaths resolve only under the `source` condition in a checkout. Their implementations and the server/client commands are excluded from npm packages and standalone binaries. `pi-client`, `pi-protocol`, and `pi-server` are development dependencies of coding-agent, not runtime dependencies. The local SDK and stdio RPC API are unchanged.
 
 ## Forking / Rebranding

@@ -421,6 +421,19 @@ async function startServerBackend(
 				.map(summarize)
 				.sort((left, right) => left.sessionId.localeCompare(right.sessionId) || left.createdAt - right.createdAt),
 		create: async (createOptions, context) => summarize(await createSession(createOptions, context)),
+		fork: async (sourceSessionId, createOptions, context) => {
+			const source = await resolveSession(sourceSessionId, context);
+			const session = await repo.fork(
+				source,
+				{ scope: "tree", ...(createOptions.id === undefined ? {} : { id: createOptions.id }) },
+				context,
+			);
+			try {
+				return summarize(session.metadata);
+			} finally {
+				await session.close(context);
+			}
+		},
 		remove: async (sessionId, context) => {
 			const metadata = await resolveSession(sessionId, context);
 			await workers.closeSession(metadata, context);

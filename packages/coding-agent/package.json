@@ -86,6 +86,7 @@
 		"@types/proper-lockfile": "4.1.4",
 		"@types/semver": "7.7.1",
 		"@types/ws": "8.18.1",
+		"irc-framework": "4.14.0",
 		"lit": "3.3.2",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
