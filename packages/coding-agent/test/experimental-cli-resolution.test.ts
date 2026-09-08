@@ -5,7 +5,7 @@ describe("experimental CLI command composition", () => {
 	test("requires an experimental subcommand", () => {
 		expect(cli.parse([])).toEqual({
 			ok: false,
-			errors: ["Expected experimental command: server or client"],
+			errors: ["Expected experimental command: server, client, or web"],
 		});
 	});
 
@@ -23,7 +23,7 @@ describe("experimental CLI command composition", () => {
 				"--model",
 				"claude-sonnet-4-5",
 			],
-			{ runServer, runClient: vi.fn(() => undefined) },
+			{ runServer, runClient: vi.fn(() => undefined), runWeb: vi.fn(() => undefined) },
 		);
 
 		const command = {
@@ -37,15 +37,34 @@ describe("experimental CLI command composition", () => {
 		expect(runServer).toHaveBeenCalledWith(command);
 	});
 
-	test.each(["server", "client"] as const)("executes the parsed %s command", async (name) => {
+	test.each(["server", "client", "web"] as const)("executes the parsed %s command", async (name) => {
 		const context = {
 			runServer: vi.fn(() => undefined),
 			runClient: vi.fn(() => undefined),
+			runWeb: vi.fn(() => undefined),
 		};
 		const result = await cli.execute([name], context);
 
 		expect(result).toEqual({ ok: true, command: { command: name } });
 		expect(context.runServer).toHaveBeenCalledTimes(name === "server" ? 1 : 0);
 		expect(context.runClient).toHaveBeenCalledTimes(name === "client" ? 1 : 0);
+		expect(context.runWeb).toHaveBeenCalledTimes(name === "web" ? 1 : 0);
+	});
+
+	test("parses web gateway options and refuses a non-loopback host without a token", async () => {
+		const context = { runServer: vi.fn(), runClient: vi.fn(), runWeb: vi.fn(() => undefined) };
+		expect(await cli.execute(["web", "--port", "8601", "--token", "abc"], context)).toEqual({
+			ok: true,
+			command: { command: "web", port: 8601, token: "abc" },
+		});
+		expect(context.runWeb).toHaveBeenCalledWith({ command: "web", port: 8601, token: "abc" });
+		expect(cli.parse(["web", "--host", "0.0.0.0"])).toEqual({
+			ok: false,
+			errors: ["--host 0.0.0.0 exposes the gateway beyond loopback; pass --token to require one"],
+		});
+		expect(cli.parse(["web", "--port", "http"])).toEqual({
+			ok: false,
+			errors: ['Invalid --port "http"; expected an integer from 0 to 65535'],
+		});
 	});
 });

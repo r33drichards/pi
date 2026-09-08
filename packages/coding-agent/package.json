@@ -85,9 +85,12 @@
 		"@types/node": "22.19.19",
 		"@types/proper-lockfile": "4.1.4",
 		"@types/semver": "7.7.1",
+		"@types/ws": "8.18.1",
+		"lit": "3.3.2",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
-		"vitest": "4.1.9"
+		"vitest": "4.1.9",
+		"ws": "8.21.0"
 	},
 	"keywords": [
 		"coding-agent",

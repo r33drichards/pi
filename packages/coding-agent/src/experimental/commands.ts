@@ -2,11 +2,13 @@ import chalk from "chalk";
 import { cli } from "../cli/experimental/cli.ts";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import type { ServerCommand } from "../cli/experimental/commands/server.ts";
+import type { WebCommand } from "../cli/experimental/commands/web.ts";
 import { areExperimentalFeaturesEnabled } from "../core/experimental.ts";
 import { runClient } from "./client.ts";
 import { runClientTui } from "./client-tui.ts";
 import type { RadiusRelayHostStatus } from "./radius-relay.ts";
 import { startForegroundServer } from "./server.ts";
+import { runWebGateway } from "./web/run.ts";
 
 async function runServerCommand(command: ServerCommand): Promise<void> {
 	let previousRelayStatus = "";
@@ -91,9 +93,15 @@ async function runClientCommand(command: ClientCommand): Promise<void> {
 
 /** Development-only command dispatch. Published entrypoints must not import this module. */
 export async function runExperimentalCommand(args: string[]): Promise<boolean> {
-	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client")) return false;
+	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client" && args[0] !== "web")) {
+		return false;
+	}
 	try {
-		const result = await cli.execute(args, { runServer: runServerCommand, runClient: runClientCommand });
+		const result = await cli.execute(args, {
+			runServer: runServerCommand,
+			runClient: runClientCommand,
+			runWeb: (command: WebCommand) => runWebGateway(command, startForegroundServer),
+		});
 		if (!result.ok) {
 			for (const error of result.errors) console.error(chalk.red(`Error: ${error}`));
 			process.exitCode = 1;
