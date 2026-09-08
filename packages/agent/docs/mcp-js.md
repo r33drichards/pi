@@ -9,25 +9,38 @@ verification status.
 ## Native prerequisite
 
 The companion [mcp-js](https://github.com/r33drichards/mcp-js) engine, from its
-`claude/mcpjs-pi-integration-k1l3w7` branch onward, exposes
-`Engine.create_with_filesystem(memory, timeout, filesystem_json)`. After
-generating the UniFFI Node bindings, this is `Engine.createWithFilesystem`. It
-takes the `filesystem` entry of the server's `--policies-json`, so `policies`,
-`pre` hooks, and `stack` layers behave exactly as they do for the server:
+`claude/mcpjs-pi-integration-k1l3w7` branch onward, is configured with
+builders and constructed with `Engine.create(config)`. Each configuration
+record has a `<Record>Builder` whose `build()` throws
+`RuntimeError.MissingRequiredField` for the first unset required field.
+`filesystem` takes the `filesystem` entry of the server's `--policies-json`, so
+`policies`, `pre` hooks, and `stack` layers behave exactly as they do for the
+server; a configuration with no policies, pre hooks, or stack is rejected.
 
-```json
-{"policies": [{"url": "file:///absolute/path/filesystem.rego"}]}
+```ts
+const config = new EngineConfigBuilder()
+  .limits(new ExecutionLimitsBuilder().heapMemoryMaxMb(64n).executionTimeoutSecs(30n).build())
+  .dataDir("/var/lib/pi/mcp-js")
+  .filesystem(
+    new FilesystemAccessBuilder()
+      .policiesJson(JSON.stringify({ policies: [{ url: "file:///absolute/path/filesystem.rego" }] }))
+      .build(),
+  )
+  .build();
+const engine = Engine.create(config);
 ```
 
-A configuration with no policies, pre hooks, or stack is rejected. The
-constructor enables hook-gated host filesystem access only: no subprocess,
-network, or module-import configuration. The same engine exposes typed native
-file methods (`fsReadFile`, `fsReadFileRange`, `fsReadTextFile`, `fsWriteFile`,
-`fsAppendFile`, `fsStat`, `fsLstat`, `fsReadDir`, `fsCanonicalPath`,
-`fsMakeDir`, `fsRemove`, `fsRename`, `fsExists`) that run through the same hook
-chain as guest `fs.*`. Build the library and bindings with the companion
-repository's `node/README.md` instructions; they are not a published npm
-dependency.
+The axes are independent: `filesystem` enables hook-gated host filesystem
+access for guest `fs.*` and the typed native file methods (`fsReadFile`,
+`fsReadFileRange`, `fsReadTextFile`, `fsWriteFile`, `fsAppendFile`, `fsStat`,
+`fsLstat`, `fsReadDir`, `fsCanonicalPath`, `fsMakeDir`, `fsRemove`, `fsRename`,
+`fsExists`); `heapStore` enables V8 heap persistence between `run_js` calls;
+`fsSnapshotStore` enables content-addressed filesystem snapshots. No
+subprocess, network, or module-import configuration is exposed.
+`Engine.createWithFilesystem(memory, timeout, filesystemJson)` remains as a
+convenience for the filesystem-only case. Build the library and bindings with
+the companion repository's `node/README.md` instructions; they are not a
+published npm dependency.
 
 ## Harness configuration
 
@@ -43,9 +56,7 @@ import {
   McpJsExecutionEnv,
 } from "@earendil-works/pi-agent-core/node";
 
-const engine = Engine.createWithFilesystem(64n, 30n, JSON.stringify({
-  policies: [{ url: "file:///absolute/path/filesystem.rego" }],
-}));
+const engine = Engine.create(config); // see the builder example above
 const env = new McpJsExecutionEnv(engine, "/work");
 
 const toolOptions = {
@@ -146,5 +157,8 @@ the same environment's filesystem, so the policy must allow the sessions root.
   tool-side truncation. No source-side bounded streaming or durable progress
   checkpoints.
 - `readTextFile`, `readBinaryFile`, and `edit` load whole files.
+- The adapter does not yet pass `heap`, `fs`, or `session` to `run_js`, so a
+  heap-persistent engine still runs each call from a fresh heap; binding a pi
+  session to a heap and a filesystem label is the next step.
 - Overlay-backed (session snapshot) engines are not supported by the native
   file methods, so the adapter only works with host-backed engines.
