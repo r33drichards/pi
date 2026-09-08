@@ -44,7 +44,9 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 
 .main { display: flex; flex-direction: column; min-height: 0; }
 .placeholder { margin: auto; text-align: center; color: var(--muted); max-width: 480px; }
-.transcript { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 12px; }
+.transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 12px; }
+/* Cards must never shrink to fit the pane; the pane scrolls instead. */
+.transcript > * { flex-shrink: 0; }
 .card { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); overflow: hidden; }
 .card header { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .card header time { margin-left: auto; }
