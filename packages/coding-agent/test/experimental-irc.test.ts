@@ -5,6 +5,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { mentionText, parseChannelList, parseCommand } from "../src/experimental/irc/commands.ts";
 import { forkEngineSession } from "../src/experimental/irc/engine-fork.ts";
 import { describeToolCall, describeToolResult, framePrompt, toIrcLines } from "../src/experimental/irc/format.ts";
+import { forkChannelName, petname } from "../src/experimental/irc/petname.ts";
 import { resolveIrcConfig } from "../src/experimental/irc/run.ts";
 import { ChannelSessionStore } from "../src/experimental/irc/state.ts";
 import { filterModels } from "../src/experimental/session-commands.ts";
@@ -23,7 +24,8 @@ describe("irc control commands", () => {
 	it("parses fork, part, sessions, help, and unknown commands", () => {
 		expect(parseCommand(",fork #dev")).toEqual({ kind: "fork", channels: ["#dev"] });
 		expect(parseCommand(",fork #dev,#ops")).toEqual({ kind: "fork", channels: ["#dev", "#ops"] });
-		expect(parseCommand(",fork")).toEqual({ kind: "error", message: "Usage: ,fork #channel[,#other]" });
+		// No target: fork into an auto-named #<channel>-<petname>.
+		expect(parseCommand(",fork")).toEqual({ kind: "fork", channels: [] });
 		expect(parseCommand(",part #dev")).toEqual({ kind: "part", channel: "#dev" });
 		expect(parseCommand(",part dev")).toEqual({ kind: "part", channel: "#dev" });
 		expect(parseCommand(",sessions")).toEqual({ kind: "sessions" });
@@ -49,7 +51,8 @@ describe("irc control commands", () => {
 		expect(inMention("pi ,fork ptest2")).toEqual({ kind: "fork", channels: ["#ptest2"] });
 		expect(inMention("pi ,fork ptest2,ptest3")).toEqual({ kind: "fork", channels: ["#ptest2", "#ptest3"] });
 		expect(inMention("pi: ,join ptest4, ptest5")).toEqual({ kind: "join", channels: ["#ptest4", "#ptest5"] });
-		expect(inMention("pi ,fork")).toEqual({ kind: "error", message: "Usage: ,fork #channel[,#other]" });
+		expect(inMention("pi ,fork")).toEqual({ kind: "fork", channels: [] });
+		expect(inMention("pi: ,fork")).toEqual({ kind: "fork", channels: [] });
 	});
 
 	it("parses session commands, bare or inside a mention", () => {
@@ -111,6 +114,29 @@ describe("irc control commands", () => {
 		// Nicks with regex characters are matched literally.
 		expect(mentionText("pi.bot: hi", "pi.bot")).toBe("hi");
 		expect(mentionText("pixbot: hi", "pi.bot")).toBeUndefined();
+	});
+});
+
+describe("fork channel names", () => {
+	it("produces a lower-case two-word petname from node-petname", () => {
+		for (let i = 0; i < 20; i += 1) expect(petname()).toMatch(/^[a-z]+-[a-z]+$/);
+	});
+
+	it("derives #<channel>-<petname> and retries taken names", () => {
+		const names = ["brave-otter", "brave-otter", "calm-lynx"];
+		let calls = 0;
+		const generate = () => names[Math.min(calls++, names.length - 1)]!;
+		const taken = (channel: string) => channel === "#clone-brave-otter";
+		expect(forkChannelName("#clone", taken, { generate })).toBe("#clone-calm-lynx");
+		expect(calls).toBe(3);
+		// A fork of a fork keeps the original channel name as the base.
+		expect(forkChannelName("#clone-brave-otter", () => false, { generate: () => "keen-newt" })).toBe(
+			"#clone-keen-newt",
+		);
+		// Bounded retries.
+		expect(() => forkChannelName("#clone", () => true, { generate: () => "x-y", attempts: 3 })).toThrow(
+			"after 3 attempts",
+		);
 	});
 });
 

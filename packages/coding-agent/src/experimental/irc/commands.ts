@@ -6,7 +6,8 @@
  * commands only this presentation has:
  *
  *   ,join #a,#b     join channels; each gets its own session
- *   ,fork #a,#b     join channels with sessions forked from the current channel's
+ *   ,fork [#a,#b]   fork the current channel's session into each channel; no
+ *                   argument forks into an auto-named #<channel>-<petname>
  *   ,part #chan     leave a channel; its session stays for a later ,join
  *   ,sessions       list channel -> session
  *   ,help
@@ -19,6 +20,7 @@ import { parseSessionCommand, SESSION_COMMANDS, type SessionCommandAction } from
 
 export type ControlCommand =
 	| { kind: "join"; channels: string[] }
+	/** No channels: fork into an auto-named `#<channel>-<petname>`. */
 	| { kind: "fork"; channels: string[] }
 	| { kind: "part"; channel: string }
 	| { kind: "sessions" }
@@ -42,7 +44,7 @@ const CONTROL_COMMANDS = [
 export const HELP_LINES = [
 	...SESSION_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
 	...CONTROL_COMMANDS.map((command) => `,${command.usage} — ${command.description}`),
-	"Mention me to talk (pi: … / … pi …) or DM me. `pi ,fork ptest2,ptest3` runs a command in a mention; # is optional.",
+	"Mention me to talk (pi: … / … pi …) or DM me. `pi ,fork ptest2,ptest3` runs a command in a mention; # is optional; `pi ,fork` alone forks into #<channel>-<petname>.",
 ];
 
 const CHANNEL = /^[#&][^\s,\x07]{1,63}$/;
@@ -93,7 +95,6 @@ export function parseCommand(line: string): IrcCommand | undefined {
 		case "fork": {
 			const { channels, invalid } = parseChannelList(argument);
 			if (invalid.length > 0) return { kind: "error", message: `Not a channel: ${invalid.join(", ")}` };
-			if (channels.length === 0) return { kind: "error", message: "Usage: ,fork #channel[,#other]" };
 			return { kind: "fork", channels };
 		}
 		case "part": {

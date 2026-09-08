@@ -12,6 +12,7 @@ import { filterModels } from "../session-commands.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
 import { type EngineForkOptions, forkEngineSession } from "./engine-fork.ts";
 import { framePrompt } from "./format.ts";
+import { forkChannelName } from "./petname.ts";
 import { SessionLink, type SessionLinkTarget } from "./session-link.ts";
 import { ChannelSessionStore } from "./state.ts";
 
@@ -353,9 +354,15 @@ export class IrcPiBot {
 			return;
 		}
 		if (command.kind === "fork") {
-			// Fork the channel the command was typed in into every target.
+			// Fork the channel the command was typed in into every target; with no
+			// target, into a fresh #<room>-<petname> (DMs fork into #<nick>-<petname>).
 			const sourceLink = await this.#linkFor(room);
-			for (const channel of command.channels) {
+			const base = isChannel(room) ? room : `#${room.toLowerCase()}`;
+			const targets =
+				command.channels.length > 0
+					? command.channels
+					: [forkChannelName(base, (candidate) => this.#store.get(candidate) !== undefined)];
+			for (const channel of targets) {
 				if (channel === room) {
 					this.say(room, `${channel} is this channel; pick another target`);
 					continue;

@@ -47,7 +47,7 @@ Channel control commands:
 | Command | Effect |
 | --- | --- |
 | `,join #a,#b` | Join channels; each gets a new Session (or its remembered one). |
-| `,fork #a,#b` | Join each channel with a Session forked from the channel the command was typed in. The conversation tree is copied with `SessionManagement.fork`; with an mcp-js coordinator the source's latest heap and filesystem snapshot are carried over too (`engine-fork.ts`). The bot replies `forked #pi -> #a (session …; heap and files carried over)` per target. |
+| `,fork [#a,#b]` | Join each channel with a Session forked from the channel the command was typed in. With no channel, forks into a fresh `#<channel>-<petname>` (for example `#clone-brave-otter`, names from `node-petname`, retried if taken). The conversation tree is copied with `SessionManagement.fork`; with an mcp-js coordinator the source's latest heap and filesystem snapshot are carried over too (`engine-fork.ts`). The bot replies `forked #pi -> #a (session …; heap and files carried over)` per target. |
 | `,part #chan` | Leave; the Session is kept and reused on the next `,join`. |
 | `,sessions` | List channel → session. |
 | `,help` | Command reference. |
