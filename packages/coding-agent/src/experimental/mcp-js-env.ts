@@ -179,7 +179,11 @@ export function createMcpJsEnvironmentFactory(
 		const files = settings.files ?? (engine.capabilities().filesystem ? "session" : "host");
 		const hostDir = sessionHostDir(agentDir, sessionId);
 		const executionCwd = files === "session" ? (settings.snapshotCwd ?? DEFAULT_SNAPSHOT_CWD) : hostDir;
-		const execution = new McpJsExecutionEnv(engine, executionCwd, { session: sessionId, files });
+		const execution = new McpJsExecutionEnv(engine, executionCwd, {
+			session: sessionId,
+			files,
+			guest: { network: settings.network === true, modules: settings.modules === true },
+		});
 		const sessionStore: FileSystem = new NodeExecutionEnv({ cwd: hostDir });
 		return { execution, sessionStore };
 	};

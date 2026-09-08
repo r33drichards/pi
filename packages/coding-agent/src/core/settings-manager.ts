@@ -124,6 +124,10 @@ export interface McpJsSettings {
 	files?: "session" | "host";
 	/** Working directory inside the session snapshot (default: `/`, the root of the initially empty snapshot). */
 	snapshotCwd?: string;
+	/** The engine's fetch policy allows network access; tells the model `fetch` works. */
+	network?: boolean;
+	/** The engine allows ES module URL imports; tells the model `import()` works (and how to clone repos). */
+	modules?: boolean;
 }
 
 export interface Settings {
