@@ -202,6 +202,10 @@ export class IrcPiBot implements ChannelDelegate {
 		this.#irc.on("registered", (event) => {
 			this.#nick = event.nick;
 			log(`IRC: registered as ${event.nick} on ${server}:${port}`);
+			// A fresh registration means a fresh connection, in no channels at all.
+			// Without this a reconnect would skip every channel the tracker still
+			// believed it was in, and the bot would come back deaf in most of them.
+			this.#joins.onDisconnected();
 			void this.#joinWanted();
 		});
 		this.#irc.on("nick in use", () => {
@@ -231,6 +235,9 @@ export class IrcPiBot implements ChannelDelegate {
 				this.say(event.target === this.#nick ? event.nick : event.target, `error: ${message(error)}`);
 			});
 		});
+		// `close` only fires once auto-reconnect gives up; `socket close` fires on
+		// every drop, which is when membership stops being true.
+		this.#irc.on("socket close", () => this.#joins.onDisconnected());
 		this.#irc.on("close", (error) => {
 			log(`IRC: connection closed${error ? " (error)" : ""}`);
 			this.#joins.onDisconnected();
