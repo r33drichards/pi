@@ -47,6 +47,11 @@ declare module "irc-framework" {
 		on(event: "reconnecting", handler: (event: { attempt: number; max_retries: number; wait: number }) => void): this;
 		on(event: "socket close", handler: (error: unknown) => void): this;
 		on(event: "join", handler: (event: { channel: string; nick: string }) => void): this;
+		on(event: "part", handler: (event: { channel: string; nick: string; message?: string }) => void): this;
+		on(
+			event: "kick",
+			handler: (event: { channel: string; nick: string; kicked: string; message?: string }) => void,
+		): this;
 		on(event: "irc error", handler: (event: { error: string; reason?: string; channel?: string }) => void): this;
 		on(event: string, handler: (...args: unknown[]) => void): this;
 	}

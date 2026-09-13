@@ -17,6 +17,7 @@ import { ChannelSession, type ChannelSessionDeps } from "./channel-session.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
 import { type EngineForkOptions, forkEngineSession, type MergeStrategy, mergeEngineSessions } from "./engine-fork.ts";
 import { forkNotice, framePrompt } from "./format.ts";
+import { failureDetail, JoinTracker } from "./join.ts";
 import { forkChannelName } from "./petname.ts";
 import { filterModels } from "./session-commands.ts";
 import { ChannelSessionStore } from "./state.ts";
@@ -55,6 +56,8 @@ export interface IrcBotOptions {
 	createClient?: () => IrcClient;
 	/** Milliseconds between consecutive lines to one target. */
 	sendSpacingMs?: number;
+	/** How long to wait for the server to confirm or refuse a JOIN. */
+	joinTimeoutMs?: number;
 }
 
 function message(error: unknown): string {
@@ -130,6 +133,10 @@ export class IrcPiBot implements ChannelDelegate {
 	readonly #lastPrompt = new Map<string, string>();
 	/** Recent extension faults per channel, to keep the log readable. */
 	readonly #faults = new Map<string, number[]>();
+	/** Confirmed channel membership; a JOIN is only a request until the server answers. */
+	readonly #joins: JoinTracker;
+	/** Channels a fork is building, so the join echo does not race it with a fresh session. */
+	readonly #forking = new Set<string>();
 	#nick: string;
 	#closed = false;
 
@@ -138,6 +145,15 @@ export class IrcPiBot implements ChannelDelegate {
 		this.#nick = options.nick;
 		this.#irc = options.createClient ? options.createClient() : new IrcClient();
 		this.#store = new ChannelSessionStore(options.statePath);
+		this.#joins = new JoinTracker({
+			issue: (channel) => this.#irc.join(channel),
+			...(options.joinTimeoutMs === undefined ? {} : { timeoutMs: options.joinTimeoutMs }),
+		});
+	}
+
+	/** Channels the server has confirmed the bot is in. */
+	get joinedChannels(): ReadonlySet<string> {
+		return this.#joins.joined;
 	}
 
 	get nick(): string {
@@ -186,7 +202,7 @@ export class IrcPiBot implements ChannelDelegate {
 		this.#irc.on("registered", (event) => {
 			this.#nick = event.nick;
 			log(`IRC: registered as ${event.nick} on ${server}:${port}`);
-			for (const channel of this.#wantedChannels()) this.#irc.join(channel);
+			void this.#joinWanted();
 		});
 		this.#irc.on("nick in use", () => {
 			this.#irc.changeNick(`${this.#nick}_`);
@@ -194,7 +210,20 @@ export class IrcPiBot implements ChannelDelegate {
 		this.#irc.on("join", (event) => {
 			if (event.nick !== this.#nick) return;
 			log(`IRC: joined ${event.channel}`);
+			this.#joins.onJoined(event.channel);
+			// A fork opens the channel's session itself, with the parent's history;
+			// opening a fresh one here would race it and relay the channel twice.
+			if (this.#forking.has(event.channel.toLowerCase())) return;
 			void this.#sessionFor(event.channel).catch((error) => log(`IRC: ${event.channel}: ${message(error)}`));
+		});
+		this.#irc.on("part", (event) => {
+			if (event.nick === this.#nick) this.#joins.onLeft(event.channel);
+		});
+		this.#irc.on("kick", (event) => {
+			if (event.kicked === this.#nick) {
+				log(`IRC: kicked from ${event.channel}`);
+				this.#joins.onLeft(event.channel);
+			}
 		});
 		this.#irc.on("privmsg", (event) => {
 			void this.#onMessage(event).catch((error) => {
@@ -202,13 +231,23 @@ export class IrcPiBot implements ChannelDelegate {
 				this.say(event.target === this.#nick ? event.nick : event.target, `error: ${message(error)}`);
 			});
 		});
-		this.#irc.on("close", (error) => log(`IRC: connection closed${error ? " (error)" : ""}`));
+		this.#irc.on("close", (error) => {
+			log(`IRC: connection closed${error ? " (error)" : ""}`);
+			this.#joins.onDisconnected();
+		});
 		this.#irc.on("reconnecting", (event) =>
 			log(`IRC: reconnecting (attempt ${event.attempt}, wait ${event.wait}ms)`),
 		);
-		this.#irc.on("irc error", (event) =>
-			log(`IRC: server error ${event.error}${event.reason ? `: ${event.reason}` : ""}`),
-		);
+		this.#irc.on("irc error", (event) => {
+			log(`IRC: server error ${event.error}${event.reason ? `: ${event.reason}` : ""}`);
+			// A refusal answers whoever is waiting on that JOIN.
+			if (this.#joins.onError(event)) return;
+			// `+n` rejects messages from outside the channel, so a send that hits it
+			// proves the membership record is stale. Drop it and the next send rejoins.
+			if (event.error === "cannot_send_to_channel" && event.channel !== undefined) {
+				this.#joins.onLeft(event.channel);
+			}
+		});
 		this.#irc.connect({
 			host: server,
 			port,
@@ -221,6 +260,29 @@ export class IrcPiBot implements ChannelDelegate {
 			auto_reconnect_max_retries: 1_000,
 			auto_reconnect_max_wait: 60_000,
 		});
+	}
+
+	/**
+	 * Join every channel we mean to be in, and say so when some are refused.
+	 * A server caps how many channels one user may be in, so a long history of
+	 * forks can outgrow the budget; silence there is what makes the bot look
+	 * present in channels it never entered.
+	 */
+	async #joinWanted(): Promise<void> {
+		const wanted = this.#wantedChannels();
+		const results = await Promise.allSettled(wanted.map((channel) => this.#joins.join(channel)));
+		const refused = results.flatMap((result, index) =>
+			result.status === "rejected" ? [{ channel: wanted[index]!, reason: message(result.reason) }] : [],
+		);
+		if (refused.length === 0) return;
+		for (const { reason } of refused) this.#options.log(`IRC: ${reason}`);
+		this.#options.log(`IRC: in ${wanted.length - refused.length} of ${wanted.length} wanted channels`);
+		this.say(this.#options.controlChannel, [
+			`could not join ${refused.length} of ${wanted.length} remembered channel(s): ${refused
+				.map(({ channel }) => channel)
+				.join(", ")}`,
+			refused[0]!.reason,
+		]);
 	}
 
 	/** Send lines to a target with spacing, so a long reply does not trip flood limits. */
@@ -434,7 +496,7 @@ export class IrcPiBot implements ChannelDelegate {
 					entries.map(
 						([channel, record]) =>
 							`${channel} → ${record.sessionId}${record.forkedFrom ? ` (forked from ${record.forkedFrom})` : ""}${
-								this.#sessions.has(channel) ? "" : " (not connected)"
+								isChannel(channel) && !this.#joins.has(channel) ? " (not in channel)" : ""
 							}`,
 					),
 				);
@@ -455,11 +517,17 @@ export class IrcPiBot implements ChannelDelegate {
 		if (command.kind === "join") {
 			for (const channel of command.channels) {
 				const record = this.#store.get(channel);
-				this.#irc.join(channel);
-				this.say(
-					room,
-					record ? `joining ${channel} (session ${record.sessionId})` : `joining ${channel} with a new session`,
-				);
+				try {
+					// Wait for the server: reporting a join it refused is how a channel
+					// ends up listed but unreachable.
+					await this.#joins.join(channel);
+					this.say(
+						room,
+						record ? `joined ${channel} (session ${record.sessionId})` : `joined ${channel} with a new session`,
+					);
+				} catch (error) {
+					this.say(room, `could not join ${channel}: ${message(error)}`);
+				}
 			}
 			return;
 		}
@@ -467,6 +535,7 @@ export class IrcPiBot implements ChannelDelegate {
 			// The session stays open in memory: closing it would invalidate the
 			// extension runtime shared with every other channel.
 			this.#irc.part(command.channel, "session kept; ,join to resume");
+			this.#joins.onLeft(command.channel);
 			this.say(room, `left ${command.channel}; its session is kept`);
 			return;
 		}
@@ -508,35 +577,43 @@ export class IrcPiBot implements ChannelDelegate {
 				`${channel} already has a session (${existing.sessionId}); ,part it and remove it from the state file to refork`,
 			);
 		}
-		const source = await this.#sessionFor(room);
-		const created = await ChannelSession.open(channel, this.#deps(channel), { forkFrom: source.sessionFile });
-		let note = "conversation carried over";
-		let forkBaseFs: string | undefined;
-		if (this.#options.engineFork) {
-			try {
-				const carried = await forkEngineSession(source.sessionId, created.sessionId, this.#options.engineFork);
-				forkBaseFs = carried.fs;
-				note = carried.seeded
-					? `files${this.#options.engineHeap && carried.heap ? ", heap," : ""} and conversation carried over`
-					: "conversation carried over; the source had no files yet";
-			} catch (error) {
-				note = `conversation carried over; files NOT carried: ${message(error)}`;
+		// Join first and wait for the verdict. A refused join (the channel limit,
+		// +i, a ban) must fail the fork outright rather than leave a session
+		// nobody can reach, and getting in first means there is nothing to undo.
+		this.#forking.add(channel);
+		try {
+			await this.#joins.join(channel);
+			const source = await this.#sessionFor(room);
+			const created = await ChannelSession.open(channel, this.#deps(channel), { forkFrom: source.sessionFile });
+			let note = "conversation carried over";
+			let forkBaseFs: string | undefined;
+			if (this.#options.engineFork) {
+				try {
+					const carried = await forkEngineSession(source.sessionId, created.sessionId, this.#options.engineFork);
+					forkBaseFs = carried.fs;
+					note = carried.seeded
+						? `files${this.#options.engineHeap && carried.heap ? ", heap," : ""} and conversation carried over`
+						: "conversation carried over; the source had no files yet";
+				} catch (error) {
+					note = `conversation carried over; files NOT carried: ${message(error)}`;
+				}
 			}
+			this.#store.set(channel, {
+				sessionId: created.sessionId,
+				sessionFile: created.sessionFile,
+				createdAt: Date.now(),
+				forkedFrom: room,
+				...(forkBaseFs === undefined ? {} : { forkBaseFs }),
+			});
+			this.#sessions.set(channel, created);
+			created.watch(this.#relayTo(channel));
+			// The fork inherits the parent's conversation, so it has to be told where
+			// it now lives; otherwise it answers as if it were still in the parent.
+			this.#pendingNotice.set(channel, forkNotice(channel, room));
+			return { sessionId: created.sessionId, note };
+		} finally {
+			this.#forking.delete(channel);
 		}
-		this.#store.set(channel, {
-			sessionId: created.sessionId,
-			sessionFile: created.sessionFile,
-			createdAt: Date.now(),
-			forkedFrom: room,
-			...(forkBaseFs === undefined ? {} : { forkBaseFs }),
-		});
-		this.#sessions.set(channel, created);
-		created.watch(this.#relayTo(channel));
-		// The fork inherits the parent's conversation, so it has to be told where
-		// it now lives; otherwise it answers as if it were still in the parent.
-		this.#pendingNotice.set(channel, forkNotice(channel, room));
-		this.#irc.join(channel);
-		return { sessionId: created.sessionId, note };
 	}
 
 	/** Merge `child`'s files into `room`'s session; the reply text is ready for the channel. */
@@ -637,8 +714,15 @@ export class IrcPiBot implements ChannelDelegate {
 				);
 			}
 		}
-		if (isChannel(channel) && !this.#store.get(channel) && !this.#sessions.has(channel)) {
-			throw new Error(`not in ${channel}; ,join it first`);
+		// The server drops messages from outside a channel (+n), so posting to one
+		// the bot never entered is silent. Join first, and surface a refusal to
+		// the caller instead of letting the line disappear.
+		if (isChannel(channel) && !this.#joins.has(channel)) {
+			try {
+				await this.#joins.join(channel);
+			} catch (error) {
+				throw new Error(`cannot post to ${channel}: ${failureDetail(error)}`);
+			}
 		}
 		this.say(channel, request.text.split("\n"));
 		// The bot never hears its own lines, so a mention in the text prompts the
