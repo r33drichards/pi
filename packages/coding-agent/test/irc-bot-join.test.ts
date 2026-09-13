@@ -162,6 +162,26 @@ describe("channel membership before sending", () => {
 		await again;
 	});
 
+	it("rejoins everything after a reconnect, not just what it had lost", async () => {
+		const { bot, irc, settle } = fixture({ channels: { "#kept": { sessionId: "s1", createdAt: 1 } } });
+		await bot.start();
+		irc.emit("registered", { nick: "pi" });
+		await settle();
+		irc.emit("join", { channel: "#pi", nick: "pi" });
+		irc.emit("join", { channel: "#kept", nick: "pi" });
+		await settle();
+		expect(irc.joins.filter((channel) => channel === "#kept")).toHaveLength(1);
+
+		// The server restarts. Membership is gone even though nothing told the bot
+		// channel by channel; a second registration must join everything again.
+		irc.emit("socket close", undefined);
+		expect(bot.joinedChannels.size).toBe(0);
+		irc.emit("registered", { nick: "pi" });
+		await settle();
+		expect(irc.joins.filter((channel) => channel === "#kept")).toHaveLength(2);
+		expect(irc.joins.filter((channel) => channel === "#pi")).toHaveLength(2);
+	});
+
 	it("forgets a channel it was kicked from or parted", async () => {
 		const { bot, irc, settle } = fixture();
 		await bot.start();
