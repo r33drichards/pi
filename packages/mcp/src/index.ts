@@ -34,6 +34,16 @@ export {
 	parseJsonRpcMessage,
 } from "./protocol/jsonrpc.ts";
 export {
+	isMcpSkill,
+	type ListSkillsResult,
+	MAX_SKILL_BYTES,
+	MAX_SKILL_RESOURCES,
+	type McpSkill,
+	SKILLS_EXTENSION,
+	type SkillResource,
+	skillResourcePath,
+} from "./protocol/skills.ts";
+export {
 	type CancelledNotification,
 	type ClientCapabilities,
 	type Implementation,
@@ -43,6 +53,7 @@ export {
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
 	type ListToolsResult,
+	MODERN_PROTOCOL_VERSION,
 	type ProgressNotification,
 	type ReadResourceResult,
 	type Resource,

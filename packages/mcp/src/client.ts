@@ -16,6 +16,7 @@ import {
 	McpTimeoutError,
 	toError,
 } from "./protocol/jsonrpc.ts";
+import { isMcpSkill, type ListSkillsResult, type McpSkill, SKILLS_EXTENSION } from "./protocol/skills.ts";
 import {
 	type ClientCapabilities,
 	type Implementation,
@@ -23,6 +24,7 @@ import {
 	LATEST_PROTOCOL_VERSION,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
+	MODERN_PROTOCOL_VERSION,
 	type ProgressNotification,
 	type ReadResourceResult,
 	type Resource,
@@ -212,6 +214,36 @@ export class McpClient {
 
 		try {
 			await transport.start();
+			if (this.options.protocolVersion === MODERN_PROTOCOL_VERSION) {
+				this.protocolVersionValue = MODERN_PROTOCOL_VERSION;
+				transport.setProtocolVersion?.(MODERN_PROTOCOL_VERSION);
+				const discovery = await this.requestInternal("server/discover", undefined, {}, true);
+				if (
+					!isObject(discovery) ||
+					discovery.resultType !== "complete" ||
+					!Array.isArray(discovery.supportedVersions) ||
+					!discovery.supportedVersions.includes(MODERN_PROTOCOL_VERSION) ||
+					!isObject(discovery.capabilities) ||
+					(discovery.instructions !== undefined && typeof discovery.instructions !== "string")
+				) {
+					throw invalid("Invalid MCP server/discover result");
+				}
+				const info = isObject(discovery._meta) ? discovery._meta["io.modelcontextprotocol/serverInfo"] : undefined;
+				const serverInfo =
+					isObject(info) && typeof info.name === "string" && typeof info.version === "string"
+						? (info as unknown as Implementation)
+						: { name: "MCP server", version: "unknown" };
+				this.serverInfoValue = serverInfo;
+				this.serverCapabilitiesValue = discovery.capabilities as ServerCapabilities;
+				this.instructionsValue = discovery.instructions as string | undefined;
+				this.state = "connected";
+				return {
+					protocolVersion: MODERN_PROTOCOL_VERSION,
+					capabilities: this.serverCapabilitiesValue,
+					serverInfo,
+					instructions: this.instructionsValue,
+				};
+			}
 			const capabilities: ClientCapabilities = { ...this.options.capabilities };
 			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
 			const result = validateInitializeResult(
@@ -230,7 +262,10 @@ export class McpClient {
 					true,
 				),
 			);
-			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
+			if (
+				result.protocolVersion === MODERN_PROTOCOL_VERSION ||
+				!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)
+			) {
 				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
 			}
 			this.protocolVersionValue = result.protocolVersion;
@@ -336,6 +371,37 @@ export class McpClient {
 		return validateReadResourceResult(await this.request("resources/read", { uri }, options));
 	}
 
+	get supportsSkills(): boolean {
+		const extension = this.serverCapabilitiesValue?.extensions?.[SKILLS_EXTENSION];
+		return this.serverCapabilitiesValue?.resources !== undefined && isObject(extension);
+	}
+
+	async listSkills(options: McpRequestOptions = {}): Promise<McpSkill[]> {
+		this.requireSkills();
+		return (await this.listAll("skills/list", "skills", isMcpSkill, options)) as unknown as McpSkill[];
+	}
+
+	async listSkillsPage(cursor?: string, options: McpRequestOptions = {}): Promise<ListSkillsResult> {
+		this.requireSkills();
+		const page = await this.listPage("skills/list", "skills", isMcpSkill, cursor, options);
+		return { skills: page.items as unknown as McpSkill[], ...pageCursor(page) };
+	}
+
+	/** Also works for skills absent from an empty or partial listing. */
+	async getSkill(uri: string, options: McpRequestOptions = {}): Promise<McpSkill> {
+		this.requireSkills();
+		const value = await this.request("skills/get", { uri }, options);
+		if (!isObject(value) || !isObject(value.skill) || !isMcpSkill(value.skill) || value.skill.uri !== uri) {
+			throw invalid("Invalid MCP skills/get result");
+		}
+		return value.skill as unknown as McpSkill;
+	}
+
+	private requireSkills(): void {
+		if (!this.supportsSkills)
+			throw new Error("MCP server did not declare the skills extension and resources capability");
+	}
+
 	private async listPage(
 		method: string,
 		key: string,
@@ -401,10 +467,21 @@ export class McpClient {
 		if (options.signal?.aborted) throw new McpAbortError();
 		const id = this.nextRequestId++;
 		const progressToken = options.onProgress ? id : undefined;
-		const requestParams =
+		let requestParams =
 			progressToken === undefined
 				? params
 				: { ...params, _meta: { ...(isObject(params?._meta) ? params._meta : {}), progressToken } };
+		if (this.protocolVersionValue === MODERN_PROTOCOL_VERSION) {
+			requestParams = {
+				...requestParams,
+				_meta: {
+					...(isObject(requestParams?._meta) ? requestParams._meta : {}),
+					"io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+					"io.modelcontextprotocol/clientInfo": { name: this.options.name, version: this.options.version },
+					"io.modelcontextprotocol/clientCapabilities": this.options.capabilities ?? {},
+				},
+			};
+		}
 		const message: JsonRpcRequest = {
 			jsonrpc: "2.0",
 			id,
@@ -423,10 +500,10 @@ export class McpClient {
 					this.cancelPending(
 						id,
 						new McpAbortError(),
-						method !== "initialize",
+						method !== "initialize" && this.protocolVersionValue !== MODERN_PROTOCOL_VERSION,
 						String(options.signal?.reason ?? "Aborted"),
 					),
-				cancellable: method !== "initialize",
+				cancellable: method !== "initialize" && this.protocolVersionValue !== MODERN_PROTOCOL_VERSION,
 				onProgress: options.onProgress,
 				progressToken,
 			};
@@ -481,7 +558,12 @@ export class McpClient {
 		}
 		this.removePending(message.id, entry);
 		if ("error" in message) entry.reject(new McpError(message.error.code, message.error.message, message.error.data));
-		else entry.resolve(message.result);
+		else if (
+			this.protocolVersionValue === MODERN_PROTOCOL_VERSION &&
+			(!isObject(message.result) || message.result.resultType !== "complete")
+		) {
+			entry.reject(invalid("Unsupported or invalid modern MCP result type"));
+		} else entry.resolve(message.result);
 	}
 
 	private async handleRequest(message: JsonRpcRequest): Promise<void> {

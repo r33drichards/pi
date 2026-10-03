@@ -134,3 +134,11 @@ Batch JSON-RPC messages, legacy HTTP+SSE, servers, sampling, and tasks are outsi
 ## Testing
 
 `@earendil-works/pi-mcp/testing` exports `createInMemoryTransportPair()` for client and adapter tests.
+
+## Skills extension (SEP-2640)
+
+`client.supportsSkills` checks the server's skills extension and resource capability. `client.listSkills()` follows pagination, `client.listSkillsPage(cursor)` returns one page, and `client.getSkill(uri)` retrieves a manifest directly. These methods validate manifests and never fetch skill files. `McpSkill`, `SkillResource`, `SKILLS_EXTENSION`, `MAX_SKILL_BYTES`, and `MAX_SKILL_RESOURCES` are exported alongside manifest validators.
+
+Hosts must obtain consent before activation and verify resources against their manifest before use. Pi's coding agent implements that host layer, including lazy loading, frontmatter checks, origin attribution, and session-scoped approvals.
+
+The default connection uses `initialize` with MCP 2025-11-25. Explicitly set the client option `protocolVersion: "2026-07-28"` for modern `server/discover` servers. Modern requests include protocol metadata and HTTP method/name headers. Only complete modern responses are supported; multi-round responses and subscriptions are outside this implementation.

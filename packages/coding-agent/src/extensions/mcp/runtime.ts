@@ -13,12 +13,14 @@ import {
 	JSON_RPC_ERROR_CODES,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
+	MAX_SKILL_BYTES,
 	McpAuthRequiredError,
 	McpClient,
 	McpError,
 	McpHttpError,
 	type McpRequestOptions,
 	McpSessionExpiredError,
+	type McpSkill,
 	type Tool as McpTool,
 	type McpTransport,
 	type ReadResourceResult,
@@ -39,6 +41,7 @@ import {
 	type McpOAuthSettings,
 } from "./oauth.ts";
 import { isMcpAppResource, type McpResourceServer } from "./resources.ts";
+import type { McpSkillServer } from "./skills.ts";
 import type { McpToolCaller } from "./tools.ts";
 
 export { McpServerLog } from "./log.ts";
@@ -117,6 +120,8 @@ export function createDefaultTransport(
 		cwd: resolve(cwd, expandHome(config.cwd ?? ".")),
 		env,
 		stderr: "pipe",
+		// A 16 MiB skill file can expand sixfold when encoded as JSON text.
+		maxMessageBytes: MAX_SKILL_BYTES * 6 + 1024 * 1024,
 	});
 }
 
@@ -152,7 +157,7 @@ async function fetchResources(
 }
 
 /** One configured server. Reconnects lazily when a call finds the connection gone. */
-export class McpServerConnection implements McpToolCaller, McpResourceServer {
+export class McpServerConnection implements McpToolCaller, McpResourceServer, McpSkillServer {
 	readonly entry: McpServerEntry;
 	state: ServerState = "connecting";
 	error: string | undefined;
@@ -162,6 +167,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	 * change, without MCP App resources.
 	 */
 	hasResources = false;
+	hasSkills = false;
+	skills: McpSkill[] = [];
 	resources: Resource[] = [];
 	resourceTemplates: ResourceTemplate[] = [];
 	/** Server instructions from `initialize`, describing its tools as a group. */
@@ -179,6 +186,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	private readonly onTools: (connection: McpServerConnection) => void;
 	private readonly onChange: ((connection: McpServerConnection) => void) | undefined;
 	private readonly log: McpServerLog | undefined;
+	private readonly onSkillRead: ((server: string, uri: string, result: ReadResourceResult) => void) | undefined;
 
 	constructor(options: {
 		entry: McpServerEntry;
@@ -192,6 +200,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		onChange?: (connection: McpServerConnection) => void;
 		/** Receives the server's log messages (`notifications/message`). */
 		log?: McpServerLog;
+		onSkillRead?: (server: string, uri: string, result: ReadResourceResult) => void;
 	}) {
 		this.entry = options.entry;
 		this.cwd = options.cwd;
@@ -199,6 +208,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.onTools = options.onTools;
 		this.onChange = options.onChange;
 		this.log = options.log;
+		this.onSkillRead = options.onSkillRead;
 		const url = this.oauthUrl;
 		const provider = "url" in this.entry.config ? this.entry.config.auth?.provider : undefined;
 		this.authProvider = url
@@ -260,8 +270,27 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		return this.withClient((client) => client.callTool(name, args, options));
 	}
 
-	readResource(uri: string, options: McpRequestOptions): Promise<ReadResourceResult> {
+	async readResource(uri: string, options: McpRequestOptions): Promise<ReadResourceResult> {
+		const result = await this.readSkillResource(uri, options);
+		this.onSkillRead?.(this.name, uri, result);
+		return result;
+	}
+
+	/** Native skill loading verifies its newly approved snapshot rather than an older held entry. */
+	readSkillResource(uri: string, options: McpRequestOptions): Promise<ReadResourceResult> {
 		return this.withClient((client) => client.readResource(uri, options), true);
+	}
+
+	getSkill(uri: string, options: McpRequestOptions): Promise<McpSkill> {
+		return this.withClient((client) => client.getSkill(uri, options), true);
+	}
+
+	async allSkills(options: McpRequestOptions): Promise<McpSkill[]> {
+		const skills = await this.withClient((client) => client.listSkills(options), true);
+		this.skills = skills;
+		this.onTools(this);
+		this.changed();
+		return skills;
 	}
 
 	resourcesPage(cursor: string | undefined, options: McpRequestOptions): Promise<ListResourcesResult> {
@@ -374,6 +403,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			name: "pi",
 			version: VERSION,
 			requestTimeoutMs: this.timeoutMs,
+			protocolVersion: this.entry.config.protocolVersion,
+			capabilities: { extensions: { "io.modelcontextprotocol/skills": {} } },
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
 		});
 		const log = this.log;
@@ -392,15 +423,19 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			client.onClose(() => this.handleClientClose(client, stdio));
 			// Servers without the tools capability (prompts or resources only) do not answer tools/list.
 			const hasResources = client.serverCapabilities?.resources !== undefined;
-			const [tools, resources] = await Promise.all([
+			const hasSkills = client.supportsSkills;
+			const [tools, resources, skills] = await Promise.all([
 				client.serverCapabilities?.tools ? client.listTools() : [],
 				hasResources ? fetchResources(client) : { resources: [], resourceTemplates: [] },
+				hasSkills ? client.listSkills() : [],
 			]);
 			if (this.closed) throw new Error("shut down while connecting");
 			if (client.connectionState !== "connected") throw new Error("connection closed during setup");
 			this.client = client;
 			this.tools = tools;
 			this.hasResources = hasResources;
+			this.hasSkills = hasSkills;
+			this.skills = skills;
 			this.resources = resources.resources;
 			this.resourceTemplates = resources.resourceTemplates;
 			this.instructions = client.instructions?.trim() || undefined;
@@ -452,11 +487,19 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async refreshResources(client: McpClient): Promise<void> {
-		const { resources, resourceTemplates } = await fetchResources(client);
-		if (this.client !== client || this.closed) return;
-		this.resources = resources;
-		this.resourceTemplates = resourceTemplates;
-		this.onTools(this);
+		try {
+			const [{ resources, resourceTemplates }, skills] = await Promise.all([
+				fetchResources(client),
+				client.supportsSkills ? client.listSkills() : [],
+			]);
+			if (this.client !== client || this.closed) return;
+			this.resources = resources;
+			this.resourceTemplates = resourceTemplates;
+			this.skills = skills;
+			this.onTools(this);
+		} catch (error) {
+			this.error = `Failed to refresh resources and skills: ${errorMessage(error)}`;
+		}
 		this.changed();
 	}
 
