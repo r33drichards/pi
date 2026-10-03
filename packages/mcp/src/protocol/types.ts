@@ -2,11 +2,18 @@ import type { BlobResourceContents, ContentAnnotations, TextResourceContents } f
 import type { JsonRpcId } from "./jsonrpc.ts";
 
 export const LATEST_PROTOCOL_VERSION = "2025-11-25";
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
 /**
  * Versions the client accepts from a server. Servers that do not support the requested version answer
  * with their own latest one, so older versions stay accepted for servers built on older SDKs.
  */
-export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"] as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = [
+	MODERN_PROTOCOL_VERSION,
+	LATEST_PROTOCOL_VERSION,
+	"2025-06-18",
+	"2025-03-26",
+	"2024-11-05",
+] as const;
 export type SupportedProtocolVersion = (typeof SUPPORTED_PROTOCOL_VERSIONS)[number];
 
 export interface Implementation {
@@ -21,6 +28,7 @@ export interface Root {
 }
 
 export interface ClientCapabilities {
+	extensions?: Record<string, Record<string, unknown>>;
 	experimental?: Record<string, unknown>;
 	roots?: { listChanged?: boolean };
 	sampling?: Record<string, unknown>;
@@ -28,6 +36,7 @@ export interface ClientCapabilities {
 }
 
 export interface ServerCapabilities {
+	extensions?: Record<string, Record<string, unknown>>;
 	experimental?: Record<string, unknown>;
 	logging?: Record<string, unknown>;
 	prompts?: { listChanged?: boolean };

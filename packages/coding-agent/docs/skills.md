@@ -91,3 +91,7 @@ Run Pi from a location where the skill is discoverable, then inspect the startup
 Use a [Pi package](packages.md) to distribute one or more skills through npm or git. Keep environment setup inside the skill and declare any required runtime dependencies in the package.
 
 For examples, see the [Anthropic skills collection](https://github.com/anthropics/skills) and [Pi skills collection](https://github.com/badlogic/pi-skills).
+
+## Skills from MCP servers
+
+Pi also supports remote skill discovery and verified loading through SEP-2640. These skills use server-scoped identities and `/mcp-skill`, with separate consent before instructions are activated. See [Remote skills](mcp.md#remote-skills-sep-2640) for configuration and limitations.
