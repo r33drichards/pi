@@ -22,6 +22,8 @@ const MCP_EXPOSURES: readonly string[] = ["codemode", "deferred", "direct", "hid
 const MCP_EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = { "codemode-deferred": "codemode" };
 
 interface McpServerConfigBase {
+	/** Use server/discover and per-request metadata for modern SEP-2640 servers. Default: legacy initialization. */
+	protocolVersion?: "2026-07-28";
 	/** Default: `codemode`. */
 	exposure?: McpExposure;
 	/**
@@ -222,6 +224,9 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	if (!SERVER_NAME.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
 	if (!isRecord(raw)) return `server "${name}" must be an object`;
 	const value = resolveExposureAliases(raw);
+	if (value.protocolVersion !== undefined && value.protocolVersion !== "2026-07-28") {
+		return `server "${name}": protocolVersion must be "2026-07-28" when specified`;
+	}
 	const { type, exposure, enabled, timeout, toolExposure, description } = value;
 	const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
 	if (exposure !== undefined && !isExposure(exposure)) {

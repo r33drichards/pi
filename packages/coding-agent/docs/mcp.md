@@ -268,3 +268,36 @@ An extension that registers `codemode` or `tool_search` similarly replaces the b
 ### Use MCP from the SDK
 
 SDK sessions do not load built-in extensions. Add the MCP extension, the codemode extension for `codemode` servers, and the tool-search extension for `deferred` servers to the resource loader. See [Codemode and MCP](sdk.md#codemode-mcp).
+
+## Remote skills (SEP-2640)
+
+Pi natively discovers servers that advertise the `io.modelcontextprotocol/skills` extension. Catalog entries appear in the model's `mcp_skills` system-prompt section with their configured server identity, name, description, and URI. Discovery reads metadata only; instructions and supporting files are loaded lazily.
+
+The model can use `list_mcp_skills`, `load_mcp_skill`, and `read_mcp_skill_file`. You can also explicitly load a skill, including one omitted from the catalog:
+
+```text
+/mcp-skill skills skill://javascript-workflow/SKILL.md Explain the workflow
+```
+
+The command takes a configured server name, the skill's advertised `SKILL.md` URI, and an optional task. Remote skills have separate names and commands from local `/skill:name` entries.
+
+Loading requires an interactive consent dialog for the specific skill and its ability to direct host execution. Pi verifies each file's advertised SHA-256 digest and byte size, and checks that `SKILL.md` frontmatter matches the manifest. Supporting files are fetched only when requested; nested `SKILL.md` files are data until separately approved. Remote `allowed-tools` metadata does not grant tool permissions. Files stay in a session-scoped memory cache outside local skill discovery.
+
+Changed manifests and resumed sessions require fresh consent before further host execution. Cross-server resource reads require a separate dialog naming the source and destination servers. Noninteractive skill activation and manifests with `resources: "dynamic"` are currently declined. Ordinary resource reads remain available as data without activating a skill.
+
+Skill storage belongs to the server. For example, a skills-enabled mcp-js server can combine local directories and S3 sources:
+
+```json
+{
+  "mcpServers": {
+    "skills": {
+      "command": "/path/to/mcp-js/target/debug/server",
+      "args": ["--skills-dir", "/path/to/skills", "--skills-s3-uri", "s3://team-skills/shared/"]
+    }
+  }
+}
+```
+
+Repeat the server's source flags to add more directories or buckets. SEP-2640 exposes discovery and reading; editing requires a separate server tool or access to the backing files.
+
+Servers using MCP 2026-07-28 `server/discover` must set `"protocolVersion": "2026-07-28"` in their server configuration. Omit it for servers using the existing `initialize` handshake, including the mcp-js adapter. Modern discovery supports complete responses over stdio and HTTP; multi-round `input_required` responses and modern subscriptions are not implemented.

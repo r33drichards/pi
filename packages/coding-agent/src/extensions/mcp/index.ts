@@ -27,6 +27,7 @@
  */
 
 import { join, resolve } from "node:path";
+import { isMcpSkill } from "@earendil-works/pi-mcp";
 import type { SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
@@ -61,6 +62,17 @@ import {
 import { loadMcpRuntime } from "./runtime.lazy.ts";
 import type * as McpRuntime from "./runtime.ts";
 import type { McpServerConnection, McpServerLog, McpTransportFactory } from "./runtime.ts";
+import {
+	createMcpSkillTools,
+	formatLoadedMcpSkill,
+	LIST_MCP_SKILLS_TOOL,
+	LOAD_MCP_SKILL_TOOL,
+	type LoadedMcpSkill,
+	MCP_SKILLS_SECTION,
+	McpSkillRegistry,
+	READ_MCP_SKILL_FILE_TOOL,
+	renderMcpSkillsSection,
+} from "./skills.ts";
 import { createMcpToolDefinition, createMcpToolName, createMcpToolRenderers, type McpToolDetails } from "./tools.ts";
 import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 
@@ -276,6 +288,8 @@ const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp 
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
 		let servers: McpServer[] = [];
+		const skillRegistry = new McpSkillRegistry();
+		let skillToolsVisible = false;
 		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
 		let configuredEntries: McpServerEntry[] = [];
 		let configErrors: string[] = [];
@@ -366,6 +380,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		});
 
 		const registerTools = (connection: McpServerConnection) => {
+			skillRegistry.observe(connection.name, connection.skills);
 			const server = connection.entry.name;
 			const entry = findServer(server)?.entry ?? connection.entry;
 			const description = entry.config.description?.trim();
@@ -416,6 +431,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				if (!current.has(name) && definition) pi.registerTool({ ...definition, exposure: "hidden" });
 			}
 			syncResourceTools();
+			syncSkillTools();
 		};
 
 		/** Make a disabled server's tools unreachable. */
@@ -426,6 +442,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			}
 			serverTools.set(server, new Set());
 			syncResourceTools();
+			syncSkillTools();
 		};
 
 		/** Enabled servers with resources whose exposure is not `hidden`, which the resource tools reach. */
@@ -435,6 +452,19 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			);
 		const resourceServers = (): McpServerConnection[] =>
 			serversWithResources().flatMap((server) => (server.connection ? [server.connection] : []));
+		const skillServers = () => resourceServers().filter((connection) => connection.hasSkills);
+		const recordSkillLoad = (entry: LoadedMcpSkill) => pi.appendEntry("mcp_skill_loaded", entry);
+		const syncSkillTools = () => {
+			const visible = skillServers().length > 0;
+			if (visible === skillToolsVisible) return;
+			skillToolsVisible = visible;
+			const tools = createMcpSkillTools({ servers: skillServers, registry: skillRegistry, onLoad: recordSkillLoad });
+			for (const tool of tools) pi.registerTool(visible ? tool : { ...tool, exposure: "hidden" });
+			if (!visible) {
+				const names = new Set(tools.map((tool) => tool.name));
+				pi.setActiveTools(pi.getActiveTools().filter((name) => !names.has(name)));
+			}
+		};
 
 		/** Exposure the resource tools were last registered with; undefined until a server has resources. */
 		let resourceToolsExposure: McpExposure | undefined;
@@ -531,6 +561,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				credentials: getCredentials(runtime),
 				providerToken: async (provider) => modelRegistry?.getApiKeyForProvider(provider),
 				log: getServerLog(runtime),
+				onSkillRead: (server, uri, result) => skillRegistry.verifyRead(server, uri, result),
 				onTools: registerTools,
 				onChange: onConnectionChange,
 			});
@@ -683,6 +714,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			if (failed) return failed;
 			if (server.connection?.state === "connected") registerTools(server.connection);
 			syncResourceTools();
+			syncSkillTools();
 			// Tools no longer exposed directly leave the declared set; direct tools are activated on registration.
 			const indirect = new Set(
 				pi
@@ -995,6 +1027,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		};
 
 		pi.on("session_start", (_event, ctx) => {
+			skillRegistry.clear();
 			const loaded = (options.loadConfig ?? defaultLoadConfig)(ctx);
 			configErrors = loaded.errors;
 			projectConfig = loaded.projectConfig;
@@ -1061,18 +1094,46 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		// appends the section to the conversation when it changed, for example after a server connected.
 		pi.on("before_agent_start", async (event, ctx) => {
 			await waitForDirectServers(ctx);
+			const restored: LoadedMcpSkill[] = [];
+			for (const entry of ctx.sessionManager.getBranch()) {
+				if (entry.type !== "custom" || entry.customType !== "mcp_skill_loaded") continue;
+				const data = entry.data as Partial<LoadedMcpSkill> | undefined;
+				if (typeof data?.server === "string" && data.skill && isMcpSkill(data.skill))
+					restored.push(data as LoadedMcpSkill);
+			}
+			skillRegistry.restore(restored);
 			const { sections } = event.systemPromptOptions;
 			const section = renderServersSection(servers);
 			if (section) sections[MCP_SERVERS_SECTION] = section;
 			else delete sections[MCP_SERVERS_SECTION];
+			const skillsSection = renderMcpSkillsSection(skillServers());
+			if (skillsSection) sections[MCP_SKILLS_SECTION] = skillsSection;
+			else delete sections[MCP_SKILLS_SECTION];
 		});
 
 		// A codemode script waits for the servers it names, or for every server when it searches or
 		// enumerates tools, so their tools are registered before the script runs. tool_search and the
 		// resource tools reach every server, so they wait for all of them.
 		pi.on("tool_call", async (event, ctx) => {
+			if (
+				event.toolName === READ_MCP_RESOURCE_TOOL ||
+				event.toolName === READ_MCP_SKILL_FILE_TOOL ||
+				event.toolName === LOAD_MCP_SKILL_TOOL
+			) {
+				const server = (event.input as { server?: unknown }).server;
+				if (typeof server === "string" && !(await skillRegistry.allowRead(server, ctx))) {
+					return { block: true, reason: "Cross-origin MCP resource read was not approved" };
+				}
+			}
 			const tool = pi.getAllTools().find((candidate) => candidate.name === event.toolName);
 			if (!tool) return;
+			if (
+				event.toolName !== LOAD_MCP_SKILL_TOOL &&
+				tool.annotations?.readOnlyHint !== true &&
+				!(await skillRegistry.allowExecution(ctx))
+			) {
+				return { block: true, reason: "MCP skill execution requires fresh per-skill approval" };
+			}
 			const pendingServers = servers.filter(
 				(server) => isEnabled(server) && server.connection?.state !== "connected" && server.ready,
 			);
@@ -1082,7 +1143,13 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				const { code } = event.input as { code?: unknown };
 				const source = typeof code === "string" ? code : "";
 				waiting = pendingServers.filter((server) => scriptNeedsServer(source, server.entry.name));
-			} else if (isToolSearchTool(tool) || RESOURCE_TOOL_NAMES.has(tool.name)) {
+			} else if (
+				isToolSearchTool(tool) ||
+				RESOURCE_TOOL_NAMES.has(tool.name) ||
+				tool.name === LIST_MCP_SKILLS_TOOL ||
+				tool.name === LOAD_MCP_SKILL_TOOL ||
+				tool.name === READ_MCP_SKILL_FILE_TOOL
+			) {
 				waiting = pendingServers;
 			}
 			await waitForServers(waiting, ctx.signal);
@@ -1136,6 +1203,53 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			servers = [];
 			emitChange();
 			await Promise.all(closing.map((connection) => connection.close()));
+		});
+
+		pi.registerCommand("mcp-skill", {
+			description: "Load a verified MCP skill: /mcp-skill <server> <SKILL.md URI> [task]",
+			getArgumentCompletions: (prefix) => {
+				const choices = skillServers().flatMap((server) =>
+					server.skills.map((skill) => ({
+						value: `${server.name} ${skill.uri}`,
+						label: `${server.name}: ${skill.frontmatter.name}`,
+						description: skill.uri,
+					})),
+				);
+				return choices.filter((choice) => choice.value.startsWith(prefix));
+			},
+			handler: async (args, ctx) => {
+				await pending;
+				await ctx.waitForIdle();
+				const [name, uri, ...task] = args.trim().split(/\s+/);
+				const server = skillServers().find((candidate) => candidate.name === name);
+				if (!server || !uri) {
+					ctx.ui.notify("Usage: /mcp-skill <server> <SKILL.md URI> [task]", "warning");
+					return;
+				}
+				try {
+					const loaded = await skillRegistry.load(
+						server,
+						uri,
+						async ({ skill }) =>
+							ctx.hasUI &&
+							(await ctx.ui.confirm(
+								"Load MCP skill",
+								`Load ${skill.frontmatter.name} from ${name}\n${uri}\n${skill.frontmatter.description}\n\nApprove this file manifest and allow host tool execution directed by this skill? Existing permissions still apply.`,
+							)),
+						{ timeoutMs: server.timeoutMs },
+					);
+					recordSkillLoad(loaded.entry);
+					pi.sendMessage({
+						customType: "mcp_skill",
+						content: formatLoadedMcpSkill(loaded.entry, loaded.text),
+						display: true,
+						details: loaded.entry,
+					});
+					if (task.length > 0) pi.sendUserMessage(task.join(" "));
+				} catch (error) {
+					ctx.ui.notify(errorMessage(error), "error");
+				}
+			},
 		});
 
 		pi.registerCommand("mcp", {

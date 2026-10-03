@@ -2,6 +2,7 @@ import type { AuthProvider, McpFetch } from "../auth-provider.ts";
 import {
 	isJsonRpcRequest,
 	isJsonRpcResponse,
+	isObject,
 	JSON_RPC_ERROR_CODES,
 	type JsonRpcId,
 	type JsonRpcMessage,
@@ -9,6 +10,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { MODERN_PROTOCOL_VERSION } from "../protocol/types.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
 
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
@@ -222,10 +224,41 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	async send(message: JsonRpcMessage): Promise<void> {
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
+		const modernHeaders: Record<string, string> = {};
+		if (this.protocolVersion === MODERN_PROTOCOL_VERSION && isJsonRpcRequest(message)) {
+			modernHeaders["MCP-Method"] = message.method;
+			const params = isObject(message.params) ? message.params : {};
+			const name = message.method === "resources/read" ? params.uri : params.name;
+			if (["tools/call", "resources/read", "prompts/get"].includes(message.method) && typeof name === "string") {
+				modernHeaders["MCP-Name"] =
+					/^[\x20-\x7e]*$/.test(name) && name.trim() === name && !/^=\?base64\?.*\?=$/.test(name)
+						? name
+						: `=?base64?${Buffer.from(name, "utf8").toString("base64")}?=`;
+			}
+		}
 		const response = await this.authorizedFetch("POST", {
-			headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				...modernHeaders,
+			},
 			body: JSON.stringify(message),
 		});
+		if (
+			!response.ok &&
+			this.protocolVersion === MODERN_PROTOCOL_VERSION &&
+			isJsonRpcRequest(message) &&
+			contentType(response) === "application/json" &&
+			response.status !== 401 &&
+			response.status !== 403
+		) {
+			const body: unknown = await response.json();
+			const error = parseJsonRpcMessage(body);
+			if (!isJsonRpcResponse(error) || !("error" in error) || error.id !== message.id)
+				throw new McpHttpError(response.status, "Invalid modern MCP error response");
+			this.emitMessage(error);
+			return;
+		}
 		await this.checkResponse(response);
 		this.captureSession(response);
 
@@ -311,6 +344,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	}
 
 	private captureSession(response: Response): void {
+		if (this.protocolVersion === MODERN_PROTOCOL_VERSION) return;
 		const sessionId = response.headers.get("mcp-session-id");
 		if (sessionId) this.sessionIdValue = sessionId;
 	}
@@ -377,7 +411,12 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 			}
 			if (answered || this.closed) return;
 			if (failure !== undefined && !this.isRetryable(failure)) break;
-			if (cursor.lastEventId === undefined || attempt >= this.maxRetries()) break;
+			if (
+				this.protocolVersion === MODERN_PROTOCOL_VERSION ||
+				cursor.lastEventId === undefined ||
+				attempt >= this.maxRetries()
+			)
+				break;
 			if (cursor.received) attempt = 0;
 			cursor.received = false;
 			if (!(await this.sleep(this.reconnectDelay(attempt++, cursor.retryMs)))) return;
