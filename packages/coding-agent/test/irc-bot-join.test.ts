@@ -87,6 +87,17 @@ function fixture(options: { channels?: Record<string, unknown> } = {}): Fixture 
 }
 
 describe("channel membership before sending", () => {
+	it("cancels a send awaiting JOIN without posting after the late acknowledgement", async () => {
+		const { bot, irc, settle } = fixture();
+		await bot.start();
+		const controller = new AbortController();
+		const sending = bot.send({ room: "#pi", channel: "#target", text: "late message", signal: controller.signal });
+		controller.abort();
+		await expect(sending).rejects.toThrow();
+		irc.emit("join", { channel: "#target", nick: "pi" });
+		await settle();
+		expect(irc.said).toHaveLength(0);
+	});
 	it("joins a channel it is not in before posting to it", async () => {
 		const { bot, irc, settle } = fixture();
 		await bot.start();

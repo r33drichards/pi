@@ -13,6 +13,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Client as IrcClient, type IrcPrivmsgEvent } from "irc-framework";
 import type { ModelRuntime } from "../core/model-runtime.ts";
+import { waitForCancellation } from "./cancellation.ts";
 import { ChannelSession, type ChannelSessionDeps } from "./channel-session.ts";
 import { HELP_LINES, type IrcCommand, isChannel, mentionText, parseCommand } from "./commands.ts";
 import { type EngineForkOptions, forkEngineSession, type MergeStrategy, mergeEngineSessions } from "./engine-fork.ts";
@@ -89,12 +90,14 @@ export function createSendQueue(
 	spacing: number,
 	onError: (error: unknown) => void,
 	stopped: () => boolean = () => false,
-): (lines: string[]) => Promise<void> {
+): ((lines: string[]) => Promise<void>) & { clear(): void } {
 	let queue: Promise<void> = Promise.resolve();
-	return (lines: string[]) => {
+	let generation = 0;
+	const enqueue = (lines: string[]) => {
+		const admitted = generation;
 		const next = queue.then(async () => {
 			for (const line of lines) {
-				if (stopped()) return;
+				if (stopped() || admitted !== generation) return;
 				try {
 					send(line);
 				} catch (error) {
@@ -106,6 +109,12 @@ export function createSendQueue(
 		queue = next.catch(() => {});
 		return queue;
 	};
+	return Object.assign(enqueue, {
+		clear: () => {
+			generation += 1;
+			queue = Promise.resolve();
+		},
+	});
 }
 
 /**
@@ -126,7 +135,8 @@ export class IrcPiBot implements ChannelDelegate {
 	readonly #store: ChannelSessionStore;
 	readonly #sessions = new Map<string, ChannelSession>();
 	readonly #opening = new Map<string, Promise<ChannelSession>>();
-	readonly #sendQueues = new Map<string, (lines: string[]) => Promise<void>>();
+	readonly #sendQueues = new Map<string, ReturnType<typeof createSendQueue>>();
+	readonly #promptGeneration = new Map<string, number>();
 	/** Channels whose next prompt carries the "you are in X" fork notice. */
 	readonly #pendingNotice = new Map<string, string>();
 	/** The last prompt text a channel received, for the irc_send policy. */
@@ -344,6 +354,7 @@ export class IrcPiBot implements ChannelDelegate {
 	/** Open (or reuse) a channel's session, creating it on first use. */
 	async #sessionFor(name: string): Promise<ChannelSession> {
 		const key = name.toLowerCase();
+		if (this.#forking.has(key)) throw new Error(`${key} has a fork in progress; wait for it to settle`);
 		const existing = this.#sessions.get(key);
 		if (existing) return existing;
 		const pending = this.#opening.get(key);
@@ -384,7 +395,13 @@ export class IrcPiBot implements ChannelDelegate {
 	async #onMessage(event: IrcPrivmsgEvent): Promise<void> {
 		if (event.from_server || event.nick === this.#nick) return;
 		const isDm = event.target.toLowerCase() === this.#nick.toLowerCase();
-		const room = isDm ? event.nick : event.target.toLowerCase();
+		const room = (isDm ? event.nick : event.target).toLowerCase();
+		// Cancellation is an out-of-band command in every channel, even when
+		// unmentioned. Never wait for a prompt, JOIN, or outgoing flood queue.
+		if (parseCommand(mentionText(event.message, this.#nick) ?? event.message)?.kind === "stop") {
+			await this.#stop(room);
+			return;
+		}
 		const control = room === this.#options.controlChannel.toLowerCase() || isDm;
 		// Channel lines are prompts only when they mention the bot. DMs are
 		// addressed by nature. Responding to everything is an explicit opt-in.
@@ -404,10 +421,22 @@ export class IrcPiBot implements ChannelDelegate {
 			}
 		}
 		if (body === undefined || body.length === 0) return;
+		const generation = this.#promptGeneration.get(room) ?? 0;
 		const session = await this.#sessionFor(room);
+		if (generation !== (this.#promptGeneration.get(room) ?? 0)) return;
 		const prompt = this.#framePromptFor(room, isDm ? `dm:${event.nick}` : room, event.nick, body);
 		if (session.busy) this.say(room, `(steering the running turn)`);
 		await session.prompt(prompt);
+	}
+
+	async #stop(room: string): Promise<void> {
+		this.#promptGeneration.set(room, (this.#promptGeneration.get(room) ?? 0) + 1);
+		this.#sendQueues.get(room)?.clear();
+		this.say(room, "stopping; pending work discarded");
+		const session = this.#sessions.get(room.toLowerCase()) ?? (await this.#opening.get(room.toLowerCase()));
+		await session?.abort();
+		this.#sendQueues.get(room)?.clear();
+		this.say(room, "stopped; ready for a new prompt");
 	}
 
 	/** The prompt text a session sees, with a one-time fork notice when it has just been forked. */
@@ -576,8 +605,12 @@ export class IrcPiBot implements ChannelDelegate {
 	 * Fork `room`'s session into `channel` (conversation, and engine files when
 	 * a coordinator is configured), remember the fork base, and join.
 	 */
-	async #forkInto(room: string, channel: string): Promise<{ sessionId: string; note: string }> {
+	async #forkInto(room: string, channel: string, signal?: AbortSignal): Promise<{ sessionId: string; note: string }> {
+		signal?.throwIfAborted();
 		if (channel === room) throw new Error(`${channel} is this channel; pick another target`);
+		if (this.#forking.has(channel) || this.#opening.has(channel)) {
+			throw new Error(`${channel} already has a session opening in progress`);
+		}
 		const existing = this.#store.get(channel);
 		if (existing) {
 			throw new Error(
@@ -590,13 +623,18 @@ export class IrcPiBot implements ChannelDelegate {
 		this.#forking.add(channel);
 		try {
 			await this.#joins.join(channel);
-			const source = await this.#sessionFor(room);
+			signal?.throwIfAborted();
+			const source = await waitForCancellation(this.#sessionFor(room), signal);
+			signal?.throwIfAborted();
 			const created = await ChannelSession.open(channel, this.#deps(channel), { forkFrom: source.sessionFile });
 			let note = "conversation carried over";
 			let forkBaseFs: string | undefined;
-			if (this.#options.engineFork) {
+			if (this.#options.engineFork && !signal?.aborted) {
 				try {
-					const carried = await forkEngineSession(source.sessionId, created.sessionId, this.#options.engineFork);
+					const carried = await forkEngineSession(source.sessionId, created.sessionId, {
+						...this.#options.engineFork,
+						signal,
+					});
 					forkBaseFs = carried.fs;
 					note = carried.seeded
 						? `files${this.#options.engineHeap && carried.heap ? ", heap," : ""} and conversation carried over`
@@ -613,10 +651,12 @@ export class IrcPiBot implements ChannelDelegate {
 				...(forkBaseFs === undefined ? {} : { forkBaseFs }),
 			});
 			this.#sessions.set(channel, created);
+			if (signal?.aborted) created.cancelDelegation();
 			created.watch(this.#relayTo(channel));
 			// The fork inherits the parent's conversation, so it has to be told where
 			// it now lives; otherwise it answers as if it were still in the parent.
 			this.#pendingNotice.set(channel, forkNotice(channel, room));
+			signal?.throwIfAborted();
 			return { sessionId: created.sessionId, note };
 		} finally {
 			this.#forking.delete(channel);
@@ -628,12 +668,14 @@ export class IrcPiBot implements ChannelDelegate {
 		room: string,
 		child: string,
 		strategy?: MergeStrategy,
+		signal?: AbortSignal,
 	): Promise<{ status: string; message: string }> {
+		signal?.throwIfAborted();
 		const engine = this.#options.engineFork;
 		if (!engine) return { status: "nothing", message: "no mcp-js coordinator is configured; nothing to merge" };
 		const childRecord = this.#store.get(child);
 		if (!childRecord) return { status: "nothing", message: `${child} has no session to merge from` };
-		const parent = await this.#sessionFor(room);
+		const parent = await waitForCancellation(this.#sessionFor(room), signal);
 		const result = await mergeEngineSessions(
 			{
 				parent: parent.sessionId,
@@ -641,7 +683,7 @@ export class IrcPiBot implements ChannelDelegate {
 				...(childRecord.forkBaseFs ? { base: childRecord.forkBaseFs } : {}),
 				...(strategy ? { prefer: strategy } : {}),
 			},
-			engine,
+			{ ...engine, signal },
 		);
 		if (result.status === "merged") {
 			return {
@@ -661,22 +703,38 @@ export class IrcPiBot implements ChannelDelegate {
 
 	// ── delegation tools, called from a channel's own session ────────────────
 
-	async spawn(request: { room: string; prompt: string; name?: string; timeoutSeconds?: number }): Promise<{
+	async spawn(request: {
+		room: string;
+		prompt: string;
+		name?: string;
+		timeoutSeconds?: number;
+		signal?: AbortSignal;
+	}): Promise<{
 		channel: string;
 		sessionId: string;
 		status: "completed" | "timeout" | "failed";
 		text: string;
 		error?: string;
 	}> {
+		const signal = request.signal;
+		signal?.throwIfAborted();
 		const room = request.room;
 		const channel = request.name
 			? isChannel(request.name)
 				? request.name.toLowerCase()
 				: `#${request.name.toLowerCase()}`
 			: this.#freshChannelName(room);
-		const forked = await this.#forkInto(room, channel);
+		const forked = await waitForCancellation(this.#forkInto(room, channel, signal), signal);
+		signal?.throwIfAborted();
 		this.say(room, `spawned ${channel} (session ${forked.sessionId}; ${forked.note})`);
 		const session = await this.#sessionFor(channel);
+		const cancel = () => {
+			// This call owns only the newly forked child, never another channel.
+			session.cancelDelegation();
+			this.#sendQueues.get(channel)?.clear();
+		};
+		signal?.addEventListener("abort", cancel, { once: true });
+		if (signal?.aborted) cancel();
 		const timeoutMs = (request.timeoutSeconds ?? 0) * 1000 || this.#options.spawnTimeoutMs || 600_000;
 		// The child channel already relays its own output; this only captures the
 		// text so a timed-out spawn can still return what the child managed to say.
@@ -687,27 +745,34 @@ export class IrcPiBot implements ChannelDelegate {
 			},
 			tool: () => {},
 		};
-		this.say(channel, `[from ${room}] ${request.prompt}`.split("\n"));
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<"timeout">((resolve) => {
 			timer = setTimeout(() => resolve("timeout"), timeoutMs);
 		});
 		try {
+			signal?.throwIfAborted();
+			this.say(channel, `[from ${room}] ${request.prompt}`.split("\n"));
 			const prompt = this.#framePromptFor(channel, channel, room, request.prompt);
-			const outcome = await Promise.race([session.prompt(prompt, capture).then((result) => result.text), timeout]);
+			const outcome = await waitForCancellation(
+				Promise.race([session.prompt(prompt, capture).then((result) => result.text), timeout]),
+				signal,
+			);
 			if (outcome === "timeout") {
-				await session.abort().catch(() => {});
+				cancel();
 				return { channel, sessionId: forked.sessionId, status: "timeout", text: partial };
 			}
 			return { channel, sessionId: forked.sessionId, status: "completed", text: outcome || partial };
 		} catch (error) {
+			if (signal?.aborted) throw error;
 			return { channel, sessionId: forked.sessionId, status: "failed", text: partial, error: message(error) };
 		} finally {
+			signal?.removeEventListener("abort", cancel);
 			if (timer) clearTimeout(timer);
 		}
 	}
 
-	async send(request: { room: string; channel: string; text: string }): Promise<void> {
+	async send(request: { room: string; channel: string; text: string; signal?: AbortSignal }): Promise<void> {
+		request.signal?.throwIfAborted();
 		const room = request.room;
 		const channel = isChannel(request.channel) ? request.channel.toLowerCase() : request.channel;
 		// A fork answers in its own channel. Posting back to the channel it was
@@ -726,25 +791,40 @@ export class IrcPiBot implements ChannelDelegate {
 		// the caller instead of letting the line disappear.
 		if (isChannel(channel) && !this.#joins.has(channel)) {
 			try {
-				await this.#joins.join(channel);
+				await waitForCancellation(this.#joins.join(channel), request.signal);
 			} catch (error) {
 				throw new Error(`cannot post to ${channel}: ${failureDetail(error)}`);
 			}
 		}
+		request.signal?.throwIfAborted();
 		this.say(channel, request.text.split("\n"));
 		// The bot never hears its own lines, so a mention in the text prompts the
 		// target channel's session here, attributed to the sending channel.
 		const mentioned = mentionText(request.text, this.#nick);
 		if (mentioned !== undefined && channel !== room && isChannel(channel)) {
 			void this.#sessionFor(channel)
-				.then((session) => session.prompt(this.#framePromptFor(channel, channel, room, mentioned)))
-				.catch((error) => this.say(channel, `error: ${message(error)}`));
+				.then((session) => {
+					request.signal?.throwIfAborted();
+					return session.prompt(this.#framePromptFor(channel, channel, room, mentioned));
+				})
+				.catch((error) => {
+					if (!request.signal?.aborted) this.say(channel, `error: ${message(error)}`);
+				});
 		}
 	}
 
-	async merge(request: { room: string; channel: string; strategy?: MergeStrategy }): Promise<{ message: string }> {
+	async merge(request: {
+		room: string;
+		channel: string;
+		strategy?: MergeStrategy;
+		signal?: AbortSignal;
+	}): Promise<{ message: string }> {
 		const child = isChannel(request.channel) ? request.channel.toLowerCase() : `#${request.channel.toLowerCase()}`;
-		const result = await this.mergeInto(request.room, child, request.strategy);
+		const result = await waitForCancellation(
+			this.mergeInto(request.room, child, request.strategy, request.signal),
+			request.signal,
+		);
+		request.signal?.throwIfAborted();
 		this.say(request.room, result.message);
 		return result;
 	}

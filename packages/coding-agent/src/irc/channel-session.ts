@@ -20,6 +20,7 @@ import type { SettingsManager } from "../core/settings-manager.ts";
 import type { EngineForkOptions } from "./engine-fork.ts";
 import { runInDomain } from "./fault-domain.ts";
 import { describeToolCall, describeToolResult, toIrcLines } from "./format.ts";
+import { installScheduleToolGuards, prepareScheduleTool } from "./schedule-tool.ts";
 import { type ChannelDelegate, createDelegationTools, createSandboxTools } from "./tools.ts";
 
 export interface RelayEvents {
@@ -46,6 +47,8 @@ export interface ChannelSessionDeps {
 	/** What the guest can reach, for an honest `run_js` description. */
 	guest?: { network?: boolean; modules?: boolean };
 	log: (line: string) => void;
+	/** Hard limits per agent run, including extension-triggered runs. */
+	runLimits?: { maxTurns: number; maxDurationMs: number };
 }
 
 export interface OpenChannelSession {
@@ -76,7 +79,18 @@ export class ChannelSession {
 	readonly #env: McpJsExecutionEnv | undefined;
 	readonly #relays = new Set<RelayEvents>();
 	#running: Promise<unknown> = Promise.resolve();
+	#steering = new Set<Promise<void>>();
 	#depth = 0;
+	#generation = 0;
+	#stopping: Promise<void> | undefined;
+	#delegationPaused = false;
+	#runTimer: ReturnType<typeof setTimeout> | undefined;
+	#turns = 0;
+	#lastToolError = "";
+	#toolArguments = new Map<string, string>();
+	#repeatedToolErrors = 0;
+	#unsubscribe: (() => void) | undefined;
+	#runLimits = { maxTurns: 32, maxDurationMs: 300_000 };
 
 	private constructor(
 		channel: string,
@@ -146,6 +160,7 @@ export class ChannelSession {
 			...(env ? { noTools: "builtin" as const } : {}),
 			customTools,
 		});
+		installScheduleToolGuards(session.agent);
 		// Extensions initialize on the session_start this emits; without it an
 		// installed extension loads but never sets itself up.
 		await session.bindExtensions({
@@ -154,6 +169,7 @@ export class ChannelSession {
 				waitForIdle: () => session.waitForIdle(),
 				reload: async () => {
 					await session.reload();
+					prepareScheduleTool(session.agent);
 				},
 				// A channel's session is bound to its channel: replacing or
 				// re-rooting it is the bot's job, through ,fork and ,join.
@@ -165,7 +181,10 @@ export class ChannelSession {
 			onError: (error: unknown) => deps.log(`IRC: ${channel}: extension error: ${String(error)}`),
 		});
 
+		prepareScheduleTool(session.agent);
+
 		const channelSession = new ChannelSession(channel, sessionId, sessionFile, session, env);
+		if (deps.runLimits) channelSession.#runLimits = deps.runLimits;
 		channelSession.#subscribe();
 		return channelSession;
 	}
@@ -176,8 +195,45 @@ export class ChannelSession {
 	 * shows up in the channel.
 	 */
 	#subscribe(): void {
-		this.session.subscribe((event) => {
-			if (this.#relays.size === 0) return;
+		this.#unsubscribe = this.session.subscribe((event) => {
+			if (event.type === "agent_start") {
+				// prompt() can still be awaiting extension/auth preflight when stop
+				// arrives. Abort its newly created controller before inference starts.
+				if (this.#stopping || this.#delegationPaused) {
+					this.session.agent.abort();
+					return;
+				}
+				this.#turns = 0;
+				this.#lastToolError = "";
+				this.#repeatedToolErrors = 0;
+				this.#toolArguments.clear();
+				clearTimeout(this.#runTimer);
+				this.#runTimer = setTimeout(() => this.#limit("run exceeded five minutes"), this.#runLimits.maxDurationMs);
+				this.#runTimer.unref();
+			} else if (event.type === "agent_end") {
+				this.#toolArguments.clear();
+				clearTimeout(this.#runTimer);
+				this.#runTimer = undefined;
+			} else if (event.type === "turn_start" && ++this.#turns > this.#runLimits.maxTurns) {
+				this.#limit(`run exceeded ${this.#runLimits.maxTurns} turns`);
+			}
+			if (event.type === "tool_execution_start") {
+				this.#toolArguments.set(event.toolCallId, JSON.stringify(event.args));
+			}
+			if (event.type === "tool_execution_end" && !this.#stopping) {
+				const result = event.result as { content?: unknown } | undefined;
+				const args = this.#toolArguments.get(event.toolCallId);
+				this.#toolArguments.delete(event.toolCallId);
+				const error = event.isError ? `${event.toolName}:${args}:${assistantText(result?.content)}` : "";
+				this.#repeatedToolErrors =
+					error && error === this.#lastToolError ? this.#repeatedToolErrors + 1 : error ? 1 : 0;
+				this.#lastToolError = error;
+				if (this.#repeatedToolErrors >= 3) {
+					this.#limit(`${event.toolName} returned the same error three times`);
+					return;
+				}
+			}
+			if (this.#relays.size === 0 || this.#stopping || this.#delegationPaused) return;
 			switch (event.type) {
 				case "message_end": {
 					const message = event.message as { role?: string; content?: unknown };
@@ -203,6 +259,13 @@ export class ChannelSession {
 		});
 	}
 
+	#limit(reason: string): void {
+		if (this.#stopping) return;
+		for (const relay of this.#relays)
+			relay.text([`Stopping: ${reason}. Send a new prompt after cancellation finishes.`]);
+		void this.abort().catch(() => {});
+	}
+
 	/** Relay this session's activity for as long as the returned handle is open. */
 	watch(relay: RelayEvents): () => void {
 		this.#relays.add(relay);
@@ -210,7 +273,7 @@ export class ChannelSession {
 	}
 
 	get busy(): boolean {
-		return this.#depth > 0;
+		return this.#depth > 0 || this.session.isStreaming;
 	}
 
 	/**
@@ -219,8 +282,18 @@ export class ChannelSession {
 	 * works.
 	 */
 	async prompt(message: string, relay?: RelayEvents): Promise<{ text: string; steered: boolean }> {
-		if (this.#depth > 0) {
-			await this.session.steer(message);
+		if (this.#stopping) throw new Error("Cancellation is still in progress; send the prompt again when stopped.");
+		this.#delegationPaused = false;
+		const generation = this.#generation;
+		if (this.busy) {
+			const steering = this.session.steer(message);
+			this.#steering.add(steering);
+			try {
+				await steering;
+			} finally {
+				this.#steering.delete(steering);
+			}
+			if (generation !== this.#generation) this.session.clearQueue();
 			return { text: "", steered: true };
 		}
 		this.#depth += 1;
@@ -229,6 +302,7 @@ export class ChannelSession {
 		const stop = relay ? this.watch(relay) : () => {};
 		const run = this.#running.then(() =>
 			runInDomain(this.channel, async () => {
+				if (generation !== this.#generation) return "";
 				await this.session.prompt(message);
 				return this.session.getLastAssistantText() ?? "";
 			}),
@@ -245,13 +319,44 @@ export class ChannelSession {
 		}
 	}
 
-	async abort(): Promise<void> {
-		await this.session.abort();
+	/** Fence an owned child's late output and scheduled runs until an explicit prompt. */
+	cancelDelegation(): void {
+		this.#delegationPaused = true;
+		void this.abort().catch(() => {});
+	}
+
+	abort(): Promise<void> {
+		if (this.#stopping) return this.#stopping;
+		this.#generation += 1;
+		clearTimeout(this.#runTimer);
+		this.#runTimer = undefined;
+		this.session.clearQueue();
+		const aborted = this.session.abort();
+		// A failed steering transform must not release the cancellation barrier
+		// while inference or another steering transform is still settling.
+		this.#stopping = Promise.allSettled([aborted, this.#running, ...this.#steering])
+			.then((results) => {
+				const failure = results.find((result) => result.status === "rejected");
+				if (failure?.status === "rejected") throw failure.reason;
+			})
+			.finally(() => {
+				this.session.clearQueue();
+				this.#stopping = undefined;
+			});
+		return this.#stopping;
 	}
 
 	async close(): Promise<void> {
-		this.session.dispose();
-		await this.#env?.cleanup(BACKGROUND_CONTEXT);
+		try {
+			await this.abort();
+		} finally {
+			this.#unsubscribe?.();
+			try {
+				this.session.dispose();
+			} finally {
+				await this.#env?.cleanup(BACKGROUND_CONTEXT);
+			}
+		}
 	}
 
 	// ── session commands ─────────────────────────────────────────────────────
@@ -287,5 +392,6 @@ export class ChannelSession {
 
 	async reload(): Promise<void> {
 		await this.session.reload();
+		prepareScheduleTool(this.session.agent);
 	}
 }

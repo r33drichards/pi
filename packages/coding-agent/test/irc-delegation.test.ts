@@ -37,6 +37,20 @@ function fakeEngine(merge: (body: Record<string, unknown>) => unknown) {
 }
 
 describe("engine fork and merge over the coordinator API", () => {
+	it("does not fold a remote merge result after cancellation", async () => {
+		const controller = new AbortController();
+		const engine = fakeEngine(() => {
+			controller.abort();
+			return { status: "merged", ca_id: "late-result" };
+		});
+		engine.logs.set("parent", [{ output_fs: "parent-fs" }]);
+		engine.logs.set("child", [{ output_fs: "child-fs" }]);
+		await expect(
+			mergeEngineSessions({ parent: "parent", child: "child" }, { ...engine.options, signal: controller.signal }),
+		).rejects.toThrow();
+		expect(engine.merges).toHaveLength(1);
+		expect(engine.execs).toHaveLength(0);
+	});
 	it("forks from the source's latest ids and reports the fork base", async () => {
 		const engine = fakeEngine(() => ({ status: "merged", ca_id: "m" }));
 		engine.logs.set("parent", [{ output_fs: "f1" }, { output_fs: "f2" }]);
@@ -143,6 +157,24 @@ describe("delegation tools", () => {
 		const merged = await run(tools, "merge_channel", { channel: "#pi-brave-otter", strategy: "theirs" });
 		expect(merged.content[0]).toMatchObject({ text: "merged #pi-brave-otter into #pi" });
 		expect(calls[2]).toEqual(["merge", { room: "#pi", channel: "#pi-brave-otter", strategy: "theirs" }]);
+	});
+
+	it("forwards cancellation to every delegation operation and rejects already stopped calls", async () => {
+		const { calls, delegate } = fakeDelegate();
+		const tools = createDelegationTools(delegate, "#pi");
+		const controller = new AbortController();
+		const params = [{ prompt: "work" }, { channel: "#target", text: "hello" }, { channel: "#child" }];
+		for (const [i, tool] of tools.entries()) {
+			await tool.execute("id", params[i] as never, controller.signal, undefined, {} as never);
+			expect(calls[i]).toEqual([expect.any(String), expect.objectContaining({ signal: controller.signal })]);
+		}
+		controller.abort();
+		for (const [i, tool] of tools.entries()) {
+			await expect(
+				tool.execute("id", params[i] as never, controller.signal, undefined, {} as never),
+			).rejects.toThrow();
+		}
+		expect(calls).toHaveLength(3);
 	});
 
 	it("surfaces a refusal from the bot as a tool error", async () => {

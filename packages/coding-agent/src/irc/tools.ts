@@ -20,7 +20,13 @@ import type { MergeStrategy } from "./engine-fork.ts";
 /** What the delegation tools need from the bot; `bot.ts` implements it. */
 export interface ChannelDelegate {
 	/** Fork this channel into a child, run `prompt` there, and wait for the answer. */
-	spawn(request: { room: string; prompt: string; name?: string; timeoutSeconds?: number }): Promise<{
+	spawn(request: {
+		room: string;
+		prompt: string;
+		name?: string;
+		timeoutSeconds?: number;
+		signal?: AbortSignal;
+	}): Promise<{
 		channel: string;
 		sessionId: string;
 		status: "completed" | "timeout" | "failed";
@@ -28,9 +34,14 @@ export interface ChannelDelegate {
 		error?: string;
 	}>;
 	/** Post to a channel the bot is in. */
-	send(request: { room: string; channel: string; text: string }): Promise<void>;
+	send(request: { room: string; channel: string; text: string; signal?: AbortSignal }): Promise<void>;
 	/** Merge a child channel's files into this channel's session. */
-	merge(request: { room: string; channel: string; strategy?: MergeStrategy }): Promise<{ message: string }>;
+	merge(request: {
+		room: string;
+		channel: string;
+		strategy?: MergeStrategy;
+		signal?: AbortSignal;
+	}): Promise<{ message: string }>;
 }
 
 const readSchema = Type.Object({
@@ -150,8 +161,9 @@ export function createDelegationTools(delegate: ChannelDelegate, room: string): 
 		description:
 			"Delegate a task to a child session in a new IRC channel forked from this one. The child starts with this session's files and conversation, runs the prompt as its own turn (its tool calls and reply appear in the child channel), and this call waits for it to finish. Returns the child's final answer, its channel, and its session id. Use it for subtasks that can run on their own; bring the child's files back with merge_channel afterwards. Blocks until the child is done or the timeout passes.",
 		parameters: spawnSchema,
-		async execute(_id, params: Static<typeof spawnSchema>) {
-			const result = await delegate.spawn({ room, ...params });
+		async execute(_id, params: Static<typeof spawnSchema>, signal) {
+			signal?.throwIfAborted();
+			const result = await delegate.spawn({ room, ...params, ...(signal ? { signal } : {}) });
 			const summary =
 				result.status === "completed"
 					? `Child ${result.channel} (session ${result.sessionId}) finished.`
@@ -168,8 +180,9 @@ export function createDelegationTools(delegate: ChannelDelegate, room: string): 
 		description:
 			"Post a message to another IRC channel the bot is in, when the user explicitly asks you to tell or notify that channel. Mentioning the bot's nick in the text prompts that channel's session, so channels can talk to each other in the open. Never use this to report your answer back to the channel you were forked from: your reply already goes to the channel you are in.",
 		parameters: sendSchema,
-		async execute(_id, params: Static<typeof sendSchema>) {
-			await delegate.send({ room, ...params });
+		async execute(_id, params: Static<typeof sendSchema>, signal) {
+			signal?.throwIfAborted();
+			await delegate.send({ room, ...params, ...(signal ? { signal } : {}) });
 			return text(`Sent to ${params.channel}.`);
 		},
 	});
@@ -179,8 +192,9 @@ export function createDelegationTools(delegate: ChannelDelegate, room: string): 
 		description:
 			"Merge a child channel's files back into this session's filesystem, three-way from the point where the child was forked (spawn_channel or ,fork). Without a strategy, conflicting paths are returned and nothing changes; pass strategy 'theirs' to take the child's version of conflicts or 'ours' to keep this session's. After a successful merge the files are visible to run_js and the read tool immediately.",
 		parameters: mergeSchema,
-		async execute(_id, params: Static<typeof mergeSchema>) {
-			const result = await delegate.merge({ room, ...params });
+		async execute(_id, params: Static<typeof mergeSchema>, signal) {
+			signal?.throwIfAborted();
+			const result = await delegate.merge({ room, ...params, ...(signal ? { signal } : {}) });
 			return text(result.message);
 		},
 	});
