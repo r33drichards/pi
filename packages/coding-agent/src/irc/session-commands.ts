@@ -9,6 +9,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export const SESSION_COMMANDS = [
+	{ name: "stop", usage: "stop", description: "Cancel this channel's run and discard pending work" },
 	{ name: "model", usage: "model [query]", description: "Pick a model; the query filters provider/id/name" },
 	{
 		name: "thinking",
@@ -20,6 +21,7 @@ export const SESSION_COMMANDS = [
 ] as const;
 
 export type SessionCommandAction =
+	| { kind: "stop" }
 	| { kind: "model"; query: string }
 	| { kind: "thinking"; level: ThinkingLevel | undefined }
 	| { kind: "compact"; instructions: string | null }
@@ -34,6 +36,8 @@ export function isThinkingLevel(value: string): value is ThinkingLevel {
 export function parseSessionCommand(name: string, argument: string): SessionCommandAction | undefined {
 	const text = argument.trim();
 	switch (name.toLowerCase()) {
+		case "stop":
+			return text ? { kind: "error", message: "Usage: ,stop" } : { kind: "stop" };
 		case "model":
 			return { kind: "model", query: text };
 		case "thinking":

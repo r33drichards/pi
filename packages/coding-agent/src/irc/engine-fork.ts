@@ -9,6 +9,8 @@
  * latest state.
  */
 
+import { setTimeout as delay } from "node:timers/promises";
+
 export interface EngineForkOptions {
 	/** The mcp-js coordinator base URL, e.g. http://mcp-js:3000. */
 	url: string;
@@ -16,6 +18,7 @@ export interface EngineForkOptions {
 	fetch?: typeof fetch;
 	/** Poll interval while a seeding execution settles. */
 	pollMs?: number;
+	signal?: AbortSignal;
 }
 
 export interface EngineState {
@@ -39,7 +42,10 @@ function endpoint(options: EngineForkOptions): {
 	headers: Record<string, string>;
 } {
 	return {
-		doFetch: options.fetch ?? fetch,
+		doFetch: (input, init) => {
+			options.signal?.throwIfAborted();
+			return (options.fetch ?? fetch)(input, { ...init, signal: options.signal });
+		},
 		base: options.url.replace(/\/+$/, ""),
 		headers: { ...options.headers, "content-type": "application/json" },
 	};
@@ -96,7 +102,7 @@ export async function foldEngineState(
 		if (status !== "running" && status !== "queued" && status !== "pending") {
 			throw new Error(`mcp-js execution (${note}) ${status}: ${error ?? "unknown error"}`);
 		}
-		await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 200));
+		await delay(options.pollMs ?? 200, undefined, { signal: options.signal });
 	}
 }
 

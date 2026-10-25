@@ -50,6 +50,7 @@ terminal client has as `/model`, `/thinking`, `/compact`, `/reload`
 
 | Command | Effect |
 | --- | --- |
+| `,stop` | Cancel the current run and discard queued steering, follow-ups, and outgoing lines. Works bare in every channel and DM, including while busy. Wait for the stopped acknowledgement before starting a new turn. |
 | `,model [query]` | No query: show the current model and the available ones. With a query: select the first model whose `provider/id name` contains it (case-insensitive), the same provider/id/name filter. |
 | `,thinking [level]` | Set the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); no level cycles. |
 | `,compact [instructions]` | Compact the Session context. |
@@ -162,3 +163,7 @@ engine fork over a fake coordinator, config, CLI parsing),
 `test/irc-delegation.test.ts` (engine fork/merge, delegation tools, the
 fork-reply policy), and `test/irc-resilience.test.ts` (fault attribution, and
 regressions for the per-channel workspace and the send queue).
+
+IRC runs stop after 32 turns, five minutes, or three consecutive identical tool errors with unchanged arguments. Cancellation signals propagate through inference, sandbox tools, and delegation tools. Cancelling `spawn_channel` promptly stops waiting, aborts its owned child, and discards queued child output. The child suppresses late output and scheduled inference until an explicit prompt resumes it; if a tool ignores abort, that child remains busy until the tool settles, while the parent can continue. Unrelated channels are untouched.
+
+Cancellation is not rollback: already sent or queued `irc_send` messages and accepted remote engine operations may still complete. Existing scheduled jobs remain installed, and the child's pause is in-memory rather than durable across process restarts. An extension must honor its abort signal to interrupt an in-flight operation. The scheduler adapter requires schedule and prompt for add calls and reports extension validation failures as tool errors.
