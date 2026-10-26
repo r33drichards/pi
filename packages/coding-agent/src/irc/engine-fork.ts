@@ -10,6 +10,7 @@
  */
 
 import { setTimeout as delay } from "node:timers/promises";
+import { waitForMcpJsReady } from "@earendil-works/pi-agent-core/node";
 
 export interface EngineForkOptions {
 	/** The mcp-js coordinator base URL, e.g. http://mcp-js:3000. */
@@ -19,6 +20,7 @@ export interface EngineForkOptions {
 	/** Poll interval while a seeding execution settles. */
 	pollMs?: number;
 	signal?: AbortSignal;
+	readinessTimeoutMs?: number;
 }
 
 export interface EngineState {
@@ -41,10 +43,18 @@ function endpoint(options: EngineForkOptions): {
 	base: string;
 	headers: Record<string, string>;
 } {
+	let lastResponseAt = 0;
 	return {
-		doFetch: (input, init) => {
+		doFetch: async (input, init) => {
 			options.signal?.throwIfAborted();
-			return (options.fetch ?? fetch)(input, { ...init, signal: options.signal });
+			if ((init?.method ?? "GET").toUpperCase() !== "GET" || Date.now() - lastResponseAt >= 30_000) {
+				await waitForMcpJsReady(options, options.signal);
+			}
+			options.signal?.throwIfAborted();
+			// A failed mutation may already have committed; never replay it.
+			const response = await (options.fetch ?? fetch)(input, { ...init, signal: options.signal });
+			lastResponseAt = response.ok ? Date.now() : 0;
+			return response;
 		},
 		base: options.url.replace(/\/+$/, ""),
 		headers: { ...options.headers, "content-type": "application/json" },
@@ -55,10 +65,7 @@ function endpoint(options: EngineForkOptions): {
 export async function engineCapabilities(
 	options: EngineForkOptions,
 ): Promise<{ heap: boolean; filesystem: boolean; sessions: boolean }> {
-	const { doFetch, base, headers } = endpoint(options);
-	const response = await doFetch(`${base}/api/capabilities`, { headers });
-	if (!response.ok) throw new Error(`mcp-js capabilities: HTTP ${response.status}`);
-	return (await response.json()) as { heap: boolean; filesystem: boolean; sessions: boolean };
+	return waitForMcpJsReady(options, options.signal);
 }
 
 /** Latest snapshot ids of an engine session, or undefined when it has no state yet. */
