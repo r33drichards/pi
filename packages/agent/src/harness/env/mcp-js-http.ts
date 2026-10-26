@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { McpJsNativeEngine, McpJsNativeExecution, McpJsNativeFsView, McpJsNativeMetadata } from "./mcp-js.ts";
 
 /** Options for {@link McpJsHttpEngine.connect}. */
@@ -10,12 +11,97 @@ export interface McpJsHttpEngineOptions {
 	pollIntervalMs?: number;
 	/** `fetch` implementation; defaults to the global one. */
 	fetch?: typeof fetch;
+	/** Total budget for read-only cold-start probes; defaults to 60 seconds. */
+	readinessTimeoutMs?: number;
 }
 
 interface Capabilities {
 	heap: boolean;
 	filesystem: boolean;
 	sessions: boolean;
+}
+
+function isReadinessTransportError(error: unknown): boolean {
+	if (!(error instanceof TypeError) || error.message !== "fetch failed") return false;
+	const transientCause = (cause: unknown): boolean => {
+		if (cause instanceof AggregateError) return cause.errors.length > 0 && cause.errors.every(transientCause);
+		return (
+			!!cause &&
+			typeof cause === "object" &&
+			"code" in cause &&
+			[
+				"ECONNREFUSED",
+				"ECONNRESET",
+				"EPIPE",
+				"ETIMEDOUT",
+				"EAI_AGAIN",
+				"ENOTFOUND",
+				"ENETUNREACH",
+				"EHOSTUNREACH",
+				"UND_ERR_CONNECT_TIMEOUT",
+				"UND_ERR_SOCKET",
+			].includes(String(cause.code))
+		);
+	};
+	return transientCause(error.cause);
+}
+
+/** Wake a sleeping coordinator using only GET; never retry the caller's operation. */
+export async function waitForMcpJsReady(
+	options: McpJsHttpEngineOptions,
+	signal?: AbortSignal | null,
+): Promise<Capabilities> {
+	const timeout = options.readinessTimeoutMs ?? 60_000;
+	if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("Invalid mcp-js readiness timeout");
+	const deadline = Date.now() + timeout;
+	const doFetch = options.fetch ?? fetch;
+	while (Date.now() < deadline) {
+		signal?.throwIfAborted();
+		const attempt = AbortSignal.timeout(Math.max(1, Math.min(10_000, Math.ceil(deadline - Date.now()))));
+		let response: Response | undefined;
+		try {
+			response = await doFetch(`${options.url.replace(/\/+$/, "")}/api/capabilities`, {
+				method: "GET",
+				headers: options.headers,
+				signal: signal ? AbortSignal.any([signal, attempt]) : attempt,
+			});
+		} catch (error) {
+			signal?.throwIfAborted();
+			const ownTimeout = attempt.aborted && error === attempt.reason;
+			if (!ownTimeout && !isReadinessTransportError(error)) throw error;
+		}
+		if (response) {
+			// Classify HTTP status before touching the body. A coincident probe
+			// timeout must never turn an auth/application error into a retry.
+			if (!response.ok) {
+				void response.body?.cancel().catch(() => {});
+				if (![502, 503, 504].includes(response.status)) {
+					throw new HttpFailure(response.status, `mcp-js readiness: HTTP ${response.status}`, undefined);
+				}
+			} else {
+				// JSON/schema failures are terminal, even if the timer also fired.
+				const result: unknown = await response.json();
+				if (
+					!result ||
+					typeof result !== "object" ||
+					!("heap" in result) ||
+					typeof result.heap !== "boolean" ||
+					!("filesystem" in result) ||
+					typeof result.filesystem !== "boolean" ||
+					!("sessions" in result) ||
+					typeof result.sessions !== "boolean"
+				)
+					throw new Error("Invalid mcp-js capabilities response");
+				signal?.throwIfAborted();
+				if (Date.now() >= deadline || attempt.aborted) break;
+				return { heap: result.heap, filesystem: result.filesystem, sessions: result.sessions };
+			}
+		}
+		const remaining = deadline - Date.now();
+		if (remaining > 0) await delay(Math.min(500, remaining), undefined, { signal: signal ?? undefined });
+	}
+	signal?.throwIfAborted();
+	throw new Error(`mcp-js readiness timed out after ${timeout}ms; operation was not submitted`);
 }
 
 class HttpFailure extends Error {
@@ -181,6 +267,7 @@ export class McpJsHttpEngine implements McpJsNativeEngine {
 	private readonly options: McpJsHttpEngineOptions;
 	private readonly base: string;
 	private readonly known: Capabilities;
+	private lastResponseAt = Date.now();
 
 	private constructor(options: McpJsHttpEngineOptions, capabilities: Capabilities) {
 		this.options = options;
@@ -190,20 +277,24 @@ export class McpJsHttpEngine implements McpJsNativeEngine {
 
 	/** Connect and read the server's capabilities. */
 	static async connect(options: McpJsHttpEngineOptions): Promise<McpJsHttpEngine> {
-		const probe = new McpJsHttpEngine(options, { heap: false, filesystem: false, sessions: false });
-		const response = await probe.request("/api/capabilities");
-		if (!response.ok) throw await failure(response);
-		const capabilities = (await response.json()) as Capabilities;
+		const capabilities = await waitForMcpJsReady(options);
 		return new McpJsHttpEngine(options, capabilities);
 	}
 
-	/** One request against the server, with the configured headers. */
+	/** Probe before mutations or after idle, then send the operation exactly once. */
 	async request(path: string, init: RequestInit = {}): Promise<Response> {
 		const doFetch = this.options.fetch ?? fetch;
-		return doFetch(`${this.base}${path}`, {
+		if ((init.method ?? "GET").toUpperCase() !== "GET" || Date.now() - this.lastResponseAt >= 30_000) {
+			await waitForMcpJsReady(this.options, init.signal);
+		}
+		init.signal?.throwIfAborted();
+		// Do not catch/replay this request, including on 502 or a lost response.
+		const response = await doFetch(`${this.base}${path}`, {
 			...init,
 			headers: { ...this.options.headers, ...(init.headers as Record<string, string> | undefined) },
 		});
+		this.lastResponseAt = response.ok ? Date.now() : 0;
+		return response;
 	}
 
 	capabilities(): Capabilities {

@@ -196,6 +196,7 @@ describe("engine fork over the coordinator API", () => {
 		const fakeFetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const url = String(input);
 			calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+			if (url.endsWith("/api/capabilities")) return Response.json({ heap: true, filesystem: true, sessions: true });
 			if (url.endsWith("/api/sessions/src/snapshots")) {
 				return Response.json([
 					{ output_heap: "h1", output_fs: "f1" },
@@ -210,7 +211,12 @@ describe("engine fork over the coordinator API", () => {
 		await expect(
 			forkEngineSession("src", "dst", { url: "http://engine/", fetch: fakeFetch, pollMs: 1 }),
 		).resolves.toEqual({ seeded: true, fs: "f2", heap: "h2" });
-		expect(calls[1]?.body).toEqual({ session: "dst", code: "// forked from session src", heap: "h2", fs: "f2" });
+		expect(calls.find((call) => call.url.endsWith("/api/exec"))?.body).toEqual({
+			session: "dst",
+			code: "// forked from session src",
+			heap: "h2",
+			fs: "f2",
+		});
 		await expect(forkEngineSession("missing", "dst", { url: "http://engine", fetch: fakeFetch })).resolves.toEqual({
 			seeded: false,
 		});

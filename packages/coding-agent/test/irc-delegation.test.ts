@@ -37,6 +37,39 @@ function fakeEngine(merge: (body: Record<string, unknown>) => unknown) {
 }
 
 describe("engine fork and merge over the coordinator API", () => {
+	it("recovers cold readiness before fork without replaying an ambiguous fold", async () => {
+		const engine = fakeEngine(() => ({ status: "merged", ca_id: "m" }));
+		engine.logs.set("parent", [{ output_fs: "f1" }]);
+		let probes = 0;
+		const doFetch: typeof fetch = async (input, init) => {
+			if (String(input).endsWith("/api/capabilities") && ++probes === 1) {
+				return new Response(null, { status: 502 });
+			}
+			const response = await engine.options.fetch!(input, init);
+			if (String(input).endsWith("/api/exec")) throw new TypeError("response lost after fold");
+			return response;
+		};
+		await expect(forkEngineSession("parent", "child", { ...engine.options, fetch: doFetch })).rejects.toThrow(
+			"response lost",
+		);
+		expect(engine.execs).toHaveLength(1);
+		expect(engine.logs.get("child")).toHaveLength(1);
+	});
+
+	it("stops before a fold when readiness is cancelled", async () => {
+		const controller = new AbortController();
+		const engine = fakeEngine(() => ({ status: "merged", ca_id: "m" }));
+		engine.logs.set("parent", [{ output_fs: "f1" }]);
+		const doFetch: typeof fetch = async (input, init) => {
+			if (String(input).endsWith("/api/capabilities")) controller.abort();
+			return engine.options.fetch!(input, init);
+		};
+		await expect(
+			forkEngineSession("parent", "child", { ...engine.options, fetch: doFetch, signal: controller.signal }),
+		).rejects.toThrow();
+		expect(engine.execs).toHaveLength(0);
+	});
+
 	it("does not fold a remote merge result after cancellation", async () => {
 		const controller = new AbortController();
 		const engine = fakeEngine(() => {

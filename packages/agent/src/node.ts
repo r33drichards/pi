@@ -8,6 +8,6 @@ export {
 	type McpJsSessionBinding,
 	nativeFileErrorCode,
 } from "./harness/env/mcp-js.ts";
-export { McpJsHttpEngine, type McpJsHttpEngineOptions } from "./harness/env/mcp-js-http.ts";
+export { McpJsHttpEngine, type McpJsHttpEngineOptions, waitForMcpJsReady } from "./harness/env/mcp-js-http.ts";
 export { NodeExecutionEnv } from "./harness/env/nodejs.ts";
 export * from "./index.ts";

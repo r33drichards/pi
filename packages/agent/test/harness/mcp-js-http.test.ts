@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { BACKGROUND_CONTEXT } from "../../src/harness/context.ts";
 import { McpJsExecutionEnv } from "../../src/harness/env/mcp-js.ts";
-import { McpJsHttpEngine } from "../../src/harness/env/mcp-js-http.ts";
+import { McpJsHttpEngine, waitForMcpJsReady } from "../../src/harness/env/mcp-js-http.ts";
 
 type Route = (url: URL, init: RequestInit) => Response | Promise<Response>;
 
@@ -128,12 +128,13 @@ describe("mcp-js HTTP engine (coordinator mode)", () => {
 		});
 		expect(fake.calls.map((call) => call.path)).toEqual([
 			"/api/capabilities",
+			"/api/capabilities",
 			"/api/exec",
 			"/api/executions/exec-1",
 			"/api/executions/exec-1",
 			"/api/executions/exec-1/output",
 		]);
-		const exec = (fake.fetch as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[1]!;
+		const exec = (fake.fetch as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[2]!;
 		expect(JSON.parse(String(exec[1].body))).toEqual({
 			code: "console.log(1)",
 			session: "pi-1",
@@ -207,5 +208,180 @@ describe("mcp-js HTTP engine (coordinator mode)", () => {
 		engine.cancelExecution("exec-9");
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		expect(fake.calls.at(-1)).toEqual({ method: "POST", path: "/api/executions/exec-9/cancel" });
+	});
+});
+
+describe("mcp-js cold-start readiness", () => {
+	it.each([401, 403, 400, 500])("does not retry HTTP %s at the timeout boundary or parse its body", async (status) => {
+		const controller = new AbortController();
+		controller.abort(new DOMException("Probe timed out", "TimeoutError"));
+		const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+		const response = json({}, status);
+		const parse = vi.spyOn(response, "json");
+		const fetch = vi.fn(async () => response);
+		try {
+			await expect(waitForMcpJsReady({ url: "http://engine", fetch })).rejects.toThrow(`HTTP ${status}`);
+			expect(fetch).toHaveBeenCalledTimes(1);
+			expect(parse).not.toHaveBeenCalled();
+		} finally {
+			timeout.mockRestore();
+		}
+	});
+
+	it.each(["bad JSON", "bad schema"])("does not retry %s even when the attempt timer fired", async (kind) => {
+		const controller = new AbortController();
+		controller.abort(new DOMException("Probe timed out", "TimeoutError"));
+		const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+		const fetch = vi.fn(async () => (kind === "bad JSON" ? new Response("{") : json({ heap: "no" })));
+		try {
+			await expect(waitForMcpJsReady({ url: "http://engine", fetch })).rejects.toThrow();
+			expect(fetch).toHaveBeenCalledTimes(1);
+		} finally {
+			timeout.mockRestore();
+		}
+	});
+
+	it("rejects a successful probe arriving at the total deadline", async () => {
+		let now = 0;
+		const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+		const fetch = vi.fn(async () => {
+			now = 20;
+			return json({ heap: false, filesystem: true, sessions: true });
+		});
+		try {
+			await expect(waitForMcpJsReady({ url: "http://engine", fetch, readinessTimeoutMs: 20 })).rejects.toThrow(
+				"not submitted",
+			);
+			expect(fetch).toHaveBeenCalledTimes(1);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it("forwards configured headers on every retry and on the single mutation", async () => {
+		const seen: RequestInit[] = [];
+		let probes = 0;
+		const engine = await McpJsHttpEngine.connect({
+			url: "http://engine",
+			headers: { authorization: "test-only", "x-route": "test" },
+			fetch: async (input, init = {}) => {
+				seen.push(init);
+				if (String(input).endsWith("/api/capabilities")) {
+					return ++probes === 1 ? json({}, 502) : json({ heap: false, filesystem: true, sessions: true });
+				}
+				return json({ execution_id: "one" });
+			},
+		});
+		await engine.callToolAsync("run_js", '{"code":"once"}', "s", undefined);
+		for (const init of seen) {
+			expect(new Headers(init.headers).get("authorization")).toBe("test-only");
+			expect(new Headers(init.headers).get("x-route")).toBe("test");
+		}
+		expect(seen.filter((init) => init.method === "POST")).toHaveLength(1);
+	});
+
+	it("aborts during backoff without waiting for the retry interval or submitting", async () => {
+		const controller = new AbortController();
+		const fetch = vi.fn(async () => {
+			setTimeout(() => controller.abort(), 20);
+			return json({}, 502);
+		});
+		const start = performance.now();
+		await expect(waitForMcpJsReady({ url: "http://engine", fetch }, controller.signal)).rejects.toThrow();
+		expect(performance.now() - start).toBeLessThan(300);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("retries identifiable connection errors but not arbitrary TypeErrors", async () => {
+		let calls = 0;
+		await waitForMcpJsReady({
+			url: "http://engine",
+			fetch: async () => {
+				if (++calls === 1) throw new TypeError("fetch failed", { cause: { code: "ECONNRESET" } });
+				return json({ heap: false, filesystem: true, sessions: true });
+			},
+		});
+		expect(calls).toBe(2);
+		const fetch = vi.fn(async () => {
+			throw new TypeError("invalid request configuration");
+		});
+		await expect(waitForMcpJsReady({ url: "http://engine", fetch })).rejects.toThrow("invalid request");
+		expect(fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it("recovers a readiness 502 before submitting a mutation once", async () => {
+		const fake = server();
+		let probes = 0;
+		const engine = await McpJsHttpEngine.connect({
+			url: "http://engine",
+			readinessTimeoutMs: 2000,
+			fetch: async (input, init) => {
+				if (String(input).endsWith("/api/capabilities") && ++probes === 2) return json({}, 502);
+				return fake.fetch(input, init);
+			},
+		});
+		await engine.callToolAsync("run_js", '{"code":"once"}', "s", undefined);
+		expect(probes).toBe(3);
+		expect(fake.calls.filter((call) => call.path === "/api/exec")).toHaveLength(1);
+	});
+
+	it("bounds a hanging readiness probe and never submits the mutation", async () => {
+		let probes = 0;
+		let submits = 0;
+		const engine = await McpJsHttpEngine.connect({
+			url: "http://engine",
+			readinessTimeoutMs: 30,
+			fetch: async (input, init) => {
+				if (!String(input).endsWith("/api/capabilities")) {
+					submits++;
+					return json({});
+				}
+				if (++probes === 1) return json({ heap: false, filesystem: true, sessions: true });
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+				});
+			},
+		});
+		await expect(engine.callToolAsync("run_js", '{"code":"once"}', "s", undefined)).rejects.toThrow("not submitted");
+		expect(submits).toBe(0);
+	});
+
+	it.each(["lost response", "502"])("never replays an ambiguous mutation: %s", async (failure) => {
+		const fake = server();
+		const engine = await McpJsHttpEngine.connect({
+			url: "http://engine",
+			fetch: async (input, init) => {
+				const response = await fake.fetch(input, init);
+				if (String(input).endsWith("/api/exec")) {
+					if (failure === "502") return json({}, 502);
+					throw new TypeError("lost response after acceptance");
+				}
+				return response;
+			},
+		});
+		await expect(engine.callToolAsync("run_js", '{"code":"once"}', "s", undefined)).rejects.toThrow();
+		expect(fake.executions.size).toBe(1);
+		expect(fake.calls.filter((call) => call.path === "/api/exec")).toHaveLength(1);
+	});
+
+	it("preserves files when execution lookup disappears; never recreates the execution", async () => {
+		const fake = server();
+		const engine = await McpJsHttpEngine.connect({ url: "http://engine", fetch: fake.fetch });
+		await engine.fsView("s").writeFile("proof", new TextEncoder().encode("persisted").buffer);
+		const accepted = JSON.parse(await engine.callToolAsync("run_js", '{"code":"once"}', "s", undefined));
+		fake.executions.clear();
+		await expect(engine.awaitExecution(accepted.execution_id)).rejects.toThrow("unknown execution");
+		expect(await engine.fsView("s").readTextFile("proof")).toBe("persisted");
+		expect(fake.calls.filter((call) => call.path === "/api/exec")).toHaveLength(1);
+	});
+
+	it("does not retry authorization failures or probe while idle", async () => {
+		const denied = vi.fn(async () => json({}, 401));
+		await expect(McpJsHttpEngine.connect({ url: "http://engine", fetch: denied })).rejects.toThrow("401");
+		expect(denied).toHaveBeenCalledTimes(1);
+		const fake = server();
+		await McpJsHttpEngine.connect({ url: "http://engine", fetch: fake.fetch });
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(fake.calls).toHaveLength(1);
 	});
 });
